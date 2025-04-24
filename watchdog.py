@@ -130,7 +130,7 @@ def start_bot(old_pid=None, force_first_trade=False):
     if old_pid:
         kill_process(old_pid)
     with open(BOT_ERRORS_LOG, 'a') as error_log:
-        command = ['python', BOT_SCRIPT]
+        command = ['venv/bin/python3', BOT_SCRIPT]
         if force_first_trade:
             command.append('--force-first-trade')
         process = subprocess.Popen(command, stderr=error_log)
@@ -205,7 +205,7 @@ def main(force_first_trade):
                         for trade in trades:
                             if trade['exit_price'] is None:
                                 message = (
-                                    f"New Trade Opened:\n"
+                                    f"[{BOT_NAME}]New Trade Opened:\n"
                                     f"Side: {trade['side']}\n"
                                     f"Entry Price: {trade['entry_price']:.2f}\n"
                                     f"Stop Loss: {trade['stop_loss']:.2f}\n"
@@ -213,7 +213,7 @@ def main(force_first_trade):
                                 )
                             else:
                                 message = (
-                                    f"Trade Closed:\n"
+                                    f"[{BOT_NAME}]Trade Closed:\n"
                                     f"Side: {trade['side']}\n"
                                     f"Exit Price: {trade['exit_price']:.2f}\n"
                                     f"Profit/Loss: {trade['profit_loss']:.2f} USDT\n"
@@ -229,11 +229,11 @@ def main(force_first_trade):
 
             except ValueError:
                 logger.error("Invalid PID in bot.pid. Starting bot...")
-                send_telegram_message("Invalid PID in bot.pid. Starting bot...")
+                send_telegram_message("[{BOT_NAME}]Invalid PID in bot.pid. Starting bot...")
                 start_bot(force_first_trade=force_first_trade)
         else:
             logger.info("bot.pid file not found. Starting bot...")
-            send_telegram_message("bot.pid file not found. Starting bot...")
+            send_telegram_message("[{BOT_NAME}]bot.pid file not found. Starting bot...")
             start_bot(force_first_trade=force_first_trade)
 
         time.sleep(30)  # Check every 30 seconds
