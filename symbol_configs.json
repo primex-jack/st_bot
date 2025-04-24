@@ -1,0 +1,8 @@
+{
+    "XRPUSDT": {
+        "quantityPrecision": 1,
+        "pricePrecision": 4,
+        "minQty": 0.1,
+        "minNotional": 5.0
+    }
+}
