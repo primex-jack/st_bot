@@ -1,0 +1,17 @@
+{
+    "binance_api_key": "123",
+    "binance_api_secret": "321",
+    "okx_api_key": "your_okx_api_key",
+    "okx_api_secret": "your_okx_api_secret",
+    "okx_passphrase": "your_okx_passphrase",
+    "telegram_token": "123:123",
+    "telegram_chat_id": "-4715373004",
+    "bot_instance": "bot1",
+    "bot_name": "BOT2-XRP30M",
+    "atr_period": 91,
+    "atr_ratio": 18,
+    "position_size": 1000,
+    "trading_pair": "XRPUSDT",
+    "timeframe": "3m",
+    "stop_loss_offset": 0.05
+}
