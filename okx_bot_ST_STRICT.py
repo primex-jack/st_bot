@@ -369,7 +369,7 @@ def display_trade_summary(position, latest_close, line_st):
 def fetch_historical_data(symbol=TRADING_PAIR, interval=TIMEFRAME, limit=1000, end_time=None, num_batches=2):
     global kline_data, historical_data_fetched
     try:
-        mainnet_client = U SIS Futures(key=BINANCE_API_KEY, secret=BINANCE_API_SECRET, base_url="https://fapi.binance.com")
+        mainnet_client = UMFutures(key=BINANCE_API_KEY, secret=BINANCE_API_SECRET, base_url="https://fapi.binance.com")
         all_data = pd.DataFrame()
         for _ in range(num_batches):
             params = {'symbol': symbol, 'interval': interval, 'limit': limit}
