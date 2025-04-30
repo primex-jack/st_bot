@@ -139,10 +139,12 @@ def load_symbol_config(symbol):
                 raise Exception(f"Failed to fetch instrument info: {instruments['retMsg']}")
             instrument = instruments['result']['list'][0]  # Take the first matching instrument
             logger.debug(f"Instrument details for {symbol}: {instrument}")
+            tick_size_str = str(instrument['priceFilter']['tickSize'])
+            price_precision = len(tick_size_str.split('.')[1]) if '.' in tick_size_str else 0
             symbol_configs[symbol] = {
                 'lotSize': float(instrument['lotSizeFilter']['qtyStep']),
                 'quantityPrecision': len(str(float(instrument['lotSizeFilter']['qtyStep'])).rstrip('0').split('.')[1]) if '.' in str(float(instrument['lotSizeFilter']['qtyStep'])) else 0,
-                'pricePrecision': int(instrument['priceFilter']['tickSize'].split('.')[1]) if '.' in str(instrument['priceFilter']['tickSize']) else 0,
+                'pricePrecision': price_precision,
                 'minQty': float(instrument['lotSizeFilter']['minOrderQty']),
                 'minNotional': float(instrument['lotSizeFilter']['minOrderQty']) * float(instrument['priceFilter']['tickSize'])  # Approximation
             }
@@ -186,7 +188,7 @@ def adjust_price(price, symbol_config):
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 def sync_position_with_bybit(client, symbol):
     try:
-        positions = client.get_position_list(category="linear", symbol=symbol)
+        positions = client.get_positions(category="linear", symbol=symbol)
         if positions['retCode'] != 0:
             raise Exception(f"Failed to fetch positions: {positions['retMsg']}")
         position_list = positions['result']['list']
