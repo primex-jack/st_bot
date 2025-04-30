@@ -284,7 +284,7 @@ def cancel_all_stop_loss_orders(client, symbol):
         logger.error(f"Failed to cancel stop-loss orders: {str(e)}")
         raise
 
-# Update stop-loss order on Bybit using conditional order
+# Update stop-loss order on Bybit using set_trading_stop
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 def update_stop_loss(client, symbol, side, new_stop_price, current_stop_order_id, current_price, position_size):
     try:
@@ -304,43 +304,48 @@ def update_stop_loss(client, symbol, side, new_stop_price, current_stop_order_id
                 new_stop_price = current_price + 0.01
                 logger.debug(f"Adjusted stop-loss for SHORT to {new_stop_price} (above current price {current_price})")
 
-        order_side = 'Sell' if side == 'LONG' else 'Buy'
-        qty = adjust_quantity(position_size, symbol_config, current_price)
-
-        # If there's an existing stop-loss order, cancel it
+        # If there's an existing stop-loss order, reset it by setting stop-loss to 0 first
         if current_stop_order_id:
-            logger.debug(f"Cancelling existing stop-loss order ID: {current_stop_order_id}")
-            cancel_result = client.cancel_order(category="linear", symbol=symbol, orderId=current_stop_order_id)
-            logger.debug(f"Cancel order response: {cancel_result}")
-            if cancel_result['retCode'] != 0:
-                logger.error(f"Failed to cancel stop-loss order: {cancel_result}")
+            logger.debug(f"Resetting existing stop-loss for {symbol}")
+            reset_response = client.set_trading_stop(
+                category="linear",
+                symbol=symbol,
+                stopLoss="0",  # Reset stop-loss
+                takeProfit="0",  # Reset take-profit
+                tpTriggerBy="LastPrice",
+                slTriggerBy="LastPrice",
+                tpslMode="Full",
+                tpOrderType="Market",
+                slOrderType="Market",
+                positionIdx=0
+            )
+            logger.debug(f"Reset stop-loss response: {reset_response}")
+            if reset_response['retCode'] != 0:
+                logger.error(f"Failed to reset stop-loss: {reset_response['retMsg']}")
+                # Attempt to cancel any existing stop-loss orders as a fallback
                 if not cancel_all_stop_loss_orders(client, symbol):
-                    raise Exception("Failed to cancel existing stop-loss orders during amendment fallback")
+                    raise Exception("Failed to cancel existing stop-loss orders during reset")
 
-        # Place a new conditional stop-loss order
-        # For LONG (Sell stop-loss): trigger when price drops below stop_price (triggerDirection=1)
-        # For SHORT (Buy stop-loss): trigger when price rises above stop_price (triggerDirection=2)
-        trigger_direction = 1 if side == 'LONG' else 2  # 1: price <= triggerPrice, 2: price >= triggerPrice
-        logger.debug(f"Placing new stop-loss order: category=linear, symbol={symbol}, side={order_side}, qty={qty}, triggerPrice={new_stop_price}, triggerDirection={trigger_direction}, reduceOnly=True")
-        stop_order = client.place_order(
+        # Set the new stop-loss using set_trading_stop
+        logger.debug(f"Setting stop-loss for {symbol}: stop_loss_price={new_stop_price}, position_idx=0")
+        response = client.set_trading_stop(
             category="linear",
             symbol=symbol,
-            side=order_side,
-            orderType="Market",
-            qty=str(qty),
-            triggerPrice=str(new_stop_price),
-            triggerDirection=trigger_direction,
-            triggerBy="LastPrice",  # Use LastPrice to trigger the stop-loss
-            reduceOnly=True,
-            positionIdx=0  # 0 for one-way mode
+            stopLoss=str(new_stop_price),
+            takeProfit="0",  # Disable take-profit
+            tpTriggerBy="LastPrice",
+            slTriggerBy="LastPrice",
+            tpslMode="Full",
+            tpOrderType="Market",
+            slOrderType="Market",
+            positionIdx=0
         )
-        logger.debug(f"Place stop-loss order response: {stop_order}")
-        if stop_order['retCode'] != 0:
-            raise Exception(f"Failed to place stop-loss order: {stop_order['retMsg']}")
+        logger.debug(f"Set stop-loss response: {response}")
+        if response['retCode'] != 0:
+            raise Exception(f"Failed to set stop-loss: {response['retMsg']}")
 
-        order_id = stop_order['result']['orderId']
-        logger.info(f"Placed new stop-loss order ID: {order_id} at {new_stop_price}")
-        return order_id
+        logger.info(f"{Fore.YELLOW}Updated stop-loss to {new_stop_price:.2f}{Style.RESET_ALL}")
+        return current_stop_order_id  # Return the existing order ID (or None if it was reset)
 
     except Exception as e:
         logger.error(f"Failed to update stop-loss: {str(e)}")
