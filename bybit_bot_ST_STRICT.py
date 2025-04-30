@@ -284,7 +284,7 @@ def cancel_all_stop_loss_orders(client, symbol):
         logger.error(f"Failed to cancel stop-loss orders: {str(e)}")
         raise
 
-# Update stop-loss order on Bybit
+# Update stop-loss order on Bybit using conditional order
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 def update_stop_loss(client, symbol, side, new_stop_price, current_stop_order_id, current_price, position_size):
     try:
@@ -307,32 +307,32 @@ def update_stop_loss(client, symbol, side, new_stop_price, current_stop_order_id
         order_side = 'Sell' if side == 'LONG' else 'Buy'
         qty = adjust_quantity(position_size, symbol_config, current_price)
 
+        # If there's an existing stop-loss order, cancel it
         if current_stop_order_id:
-            logger.debug(f"Modifying existing stop-loss order ID: {current_stop_order_id}")
-            amend_result = client.amend_order(
-                category="linear",
-                symbol=symbol,
-                orderId=current_stop_order_id,
-                stopLoss=str(new_stop_price)
-            )
-            logger.debug(f"Amend stop-loss response: {amend_result}")
-            if amend_result['retCode'] != 0:
-                logger.error(f"Failed to amend stop-loss order: {amend_result}")
+            logger.debug(f"Cancelling existing stop-loss order ID: {current_stop_order_id}")
+            cancel_result = client.cancel_order(category="linear", symbol=symbol, orderId=current_stop_order_id)
+            logger.debug(f"Cancel order response: {cancel_result}")
+            if cancel_result['retCode'] != 0:
+                logger.error(f"Failed to cancel stop-loss order: {cancel_result}")
                 if not cancel_all_stop_loss_orders(client, symbol):
                     raise Exception("Failed to cancel existing stop-loss orders during amendment fallback")
-            else:
-                logger.info(f"Successfully modified stop-loss order ID: {current_stop_order_id} to new price: {new_stop_price}")
-                return current_stop_order_id
 
-        logger.debug(f"Placing new stop-loss order: category=linear, symbol={symbol}, side={order_side}, qty={qty}, stopLoss={new_stop_price}, reduceOnly=True")
+        # Place a new conditional stop-loss order
+        # For LONG (Sell stop-loss): trigger when price drops below stop_price (triggerDirection=1)
+        # For SHORT (Buy stop-loss): trigger when price rises above stop_price (triggerDirection=2)
+        trigger_direction = 1 if side == 'LONG' else 2  # 1: price <= triggerPrice, 2: price >= triggerPrice
+        logger.debug(f"Placing new stop-loss order: category=linear, symbol={symbol}, side={order_side}, qty={qty}, triggerPrice={new_stop_price}, triggerDirection={trigger_direction}, reduceOnly=True")
         stop_order = client.place_order(
             category="linear",
             symbol=symbol,
             side=order_side,
             orderType="Market",
             qty=str(qty),
-            stopLoss=str(new_stop_price),
-            reduceOnly=True
+            triggerPrice=str(new_stop_price),
+            triggerDirection=trigger_direction,
+            triggerBy="LastPrice",  # Use LastPrice to trigger the stop-loss
+            reduceOnly=True,
+            positionIdx=0  # 0 for one-way mode
         )
         logger.debug(f"Place stop-loss order response: {stop_order}")
         if stop_order['retCode'] != 0:
@@ -535,7 +535,6 @@ def on_open(ws):
 def on_message(ws, message):
     global kline_data, first_closed_candle_received, first_closed_timestamp, closed_candle_count, historical_data_fetched, current_position, trade_history, conn, previous_trend
     try:
-        logger.debug(f"Received WebSocket message: {message}")
         data = json.loads(message)
         if 'data' not in data or 'k' not in data['data']:
             logger.debug("Message does not contain kline data, skipping")
