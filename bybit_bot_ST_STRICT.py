@@ -11,7 +11,7 @@ from colorama import init, Fore, Style
 import argparse
 import os
 from tenacity import retry, wait_exponential, stop_after_attempt
-from pybit import HTTP
+from pybit.unified_trading import HTTP  # Updated import
 
 # Initialize colorama for colored terminal output
 init()
@@ -98,9 +98,9 @@ binance_client = UMFutures(key=BINANCE_API_KEY, secret=BINANCE_API_SECRET, base_
 
 # Initialize Bybit client for trading
 bybit_client = HTTP(
-    endpoint="https://api.bybit.com",
     api_key=BYBIT_API_KEY,
-    api_secret=BYBIT_API_SECRET
+    api_secret=BYBIT_API_SECRET,
+    testnet=False  # Set to True for testnet
 )
 
 # Global DataFrame to store kline data with explicit dtypes
@@ -135,16 +135,16 @@ def load_symbol_config(symbol):
     if symbol not in symbol_configs:
         try:
             instruments = bybit_client.get_instruments_info(category="linear", symbol=symbol)
-            if instruments['ret_code'] != 0:
-                raise Exception(f"Failed to fetch instrument info: {instruments['ret_msg']}")
+            if instruments['retCode'] != 0:
+                raise Exception(f"Failed to fetch instrument info: {instruments['retMsg']}")
             instrument = instruments['result']['list'][0]  # Take the first matching instrument
             logger.debug(f"Instrument details for {symbol}: {instrument}")
             symbol_configs[symbol] = {
-                'lotSize': float(instrument['lot_size_filter']['qty_step']),
-                'quantityPrecision': len(str(float(instrument['lot_size_filter']['qty_step'])).rstrip('0').split('.')[1]) if '.' in str(float(instrument['lot_size_filter']['qty_step'])) else 0,
-                'pricePrecision': int(instrument['price_scale']),
-                'minQty': float(instrument['lot_size_filter']['min_trading_qty']),
-                'minNotional': float(instrument['lot_size_filter']['min_trading_qty']) * float(instrument['price_filter']['tick_size'])  # Approximation
+                'lotSize': float(instrument['lotSizeFilter']['qtyStep']),
+                'quantityPrecision': len(str(float(instrument['lotSizeFilter']['qtyStep'])).rstrip('0').split('.')[1]) if '.' in str(float(instrument['lotSizeFilter']['qtyStep'])) else 0,
+                'pricePrecision': int(instrument['priceFilter']['tickSize'].split('.')[1]) if '.' in str(instrument['priceFilter']['tickSize']) else 0,
+                'minQty': float(instrument['lotSizeFilter']['minOrderQty']),
+                'minNotional': float(instrument['lotSizeFilter']['minOrderQty']) * float(instrument['priceFilter']['tickSize'])  # Approximation
             }
             with open(SYMBOL_CONFIG_FILE, 'w') as f:
                 json.dump(symbol_configs, f, indent=4)
@@ -186,9 +186,9 @@ def adjust_price(price, symbol_config):
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 def sync_position_with_bybit(client, symbol):
     try:
-        positions = client.get_position_info(category="linear", symbol=symbol)
-        if positions['ret_code'] != 0:
-            raise Exception(f"Failed to fetch positions: {positions['ret_msg']}")
+        positions = client.get_position_list(category="linear", symbol=symbol)
+        if positions['retCode'] != 0:
+            raise Exception(f"Failed to fetch positions: {positions['retMsg']}")
         position_list = positions['result']['list']
         position = next((pos for pos in position_list if float(pos['size']) > 0), None)
         if not position:
@@ -196,22 +196,22 @@ def sync_position_with_bybit(client, symbol):
             return None
 
         side = 'LONG' if position['side'] == 'Buy' else 'SHORT'
-        entry_price = float(position['avg_price'])
-        size = float(position['size'])  # Bybit uses base currency units (e.g., ETH)
+        entry_price = float(position['avgPrice'])
+        size = float(position['size'])
 
         # Fetch stop-loss orders
         orders = client.get_open_orders(category="linear", symbol=symbol)
-        if orders['ret_code'] != 0:
-            raise Exception(f"Failed to fetch orders: {orders['ret_msg']}")
+        if orders['retCode'] != 0:
+            raise Exception(f"Failed to fetch orders: {orders['retMsg']}")
         stop_loss_order = next(
             (order for order in orders['result']['list']
-             if order['stop_order_type'] == 'StopLoss' and
+             if order['stopOrderType'] == 'StopLoss' and
              order['side'] == ('Sell' if side == 'LONG' else 'Buy') and
              float(order['qty']) == float(position['size'])),
             None
         )
-        stop_loss = float(stop_loss_order['trigger_price']) if stop_loss_order else None
-        stop_loss_order_id = stop_loss_order['order_id'] if stop_loss_order else None
+        stop_loss = float(stop_loss_order['triggerPrice']) if stop_loss_order else None
+        stop_loss_order_id = stop_loss_order['orderId'] if stop_loss_order else None
 
         synced_position = {
             'side': side,
@@ -219,7 +219,7 @@ def sync_position_with_bybit(client, symbol):
             'size': size,
             'stop_loss': stop_loss,
             'stop_loss_order_id': stop_loss_order_id,
-            'open_time': position.get('created_time', str(datetime.now(timezone.utc)))
+            'open_time': position.get('createdTime', str(datetime.now(timezone.utc)))
         }
 
         logger.info(f"Synced position: {synced_position}")
@@ -232,23 +232,23 @@ def sync_position_with_bybit(client, symbol):
 def cancel_all_stop_loss_orders(client, symbol):
     try:
         orders = client.get_open_orders(category="linear", symbol=symbol)
-        if orders['ret_code'] != 0:
-            raise Exception(f"Failed to fetch orders: {orders['ret_msg']}")
-        stop_loss_orders = [order for order in orders['result']['list'] if order['stop_order_type'] == 'StopLoss']
+        if orders['retCode'] != 0:
+            raise Exception(f"Failed to fetch orders: {orders['retMsg']}")
+        stop_loss_orders = [order for order in orders['result']['list'] if order['stopOrderType'] == 'StopLoss']
         if not stop_loss_orders:
             logger.debug(f"No stop-loss orders to cancel for {symbol}")
             return True
 
         for order in stop_loss_orders:
-            cancel_result = client.cancel_order(category="linear", symbol=symbol, order_id=order['order_id'])
-            if cancel_result['ret_code'] != 0:
-                raise Exception(f"Failed to cancel order: {cancel_result['ret_msg']}")
-            logger.debug(f"Canceled stop-loss order ID: {order['order_id']}")
+            cancel_result = client.cancel_order(category="linear", symbol=symbol, orderId=order['orderId'])
+            if cancel_result['retCode'] != 0:
+                raise Exception(f"Failed to cancel order: {cancel_result['retMsg']}")
+            logger.debug(f"Canceled stop-loss order ID: {order['orderId']}")
 
         orders = client.get_open_orders(category="linear", symbol=symbol)
-        if orders['ret_code'] != 0:
-            raise Exception(f"Failed to fetch orders after cancellation: {orders['ret_msg']}")
-        remaining_orders = [order for order in orders['result']['list'] if order['stop_order_type'] == 'StopLoss']
+        if orders['retCode'] != 0:
+            raise Exception(f"Failed to fetch orders after cancellation: {orders['retMsg']}")
+        remaining_orders = [order for order in orders['result']['list'] if order['stopOrderType'] == 'StopLoss']
         if remaining_orders:
             logger.error(f"Failed to cancel all stop-loss orders. Remaining orders: {remaining_orders}")
             return False
@@ -279,10 +279,10 @@ def update_stop_loss(client, symbol, side, new_stop_price, current_stop_order_id
             amend_result = client.amend_order(
                 category="linear",
                 symbol=symbol,
-                order_id=current_stop_order_id,
-                trigger_price=str(new_stop_price)
+                orderId=current_stop_order_id,
+                stopLoss=str(new_stop_price)
             )
-            if amend_result['ret_code'] != 0:
+            if amend_result['retCode'] != 0:
                 logger.error(f"Failed to amend stop-loss order: {amend_result}")
                 if not cancel_all_stop_loss_orders(client, symbol):
                     raise Exception("Failed to cancel existing stop-loss orders during amendment fallback")
@@ -294,15 +294,15 @@ def update_stop_loss(client, symbol, side, new_stop_price, current_stop_order_id
             category="linear",
             symbol=symbol,
             side=order_side,
-            order_type="Market",
+            orderType="Market",
             qty=str(qty),
-            stop_loss=str(new_stop_price),
-            reduce_only=True
+            stopLoss=str(new_stop_price),
+            reduceOnly=True
         )
-        if stop_order['ret_code'] != 0:
-            raise Exception(f"Failed to place stop-loss order: {stop_order['ret_msg']}")
+        if stop_order['retCode'] != 0:
+            raise Exception(f"Failed to place stop-loss order: {stop_order['retMsg']}")
 
-        order_id = stop_order['result']['order_id']
+        order_id = stop_order['result']['orderId']
         logger.info(f"Placed new stop-loss order ID: {order_id} at {new_stop_price}")
         return order_id
 
@@ -565,13 +565,13 @@ def on_message(ws, message):
                                 category="linear",
                                 symbol=BYBIT_TRADING_PAIR,
                                 side="Sell",
-                                order_type="Market",
+                                orderType="Market",
                                 qty=str(adjusted_quantity),
-                                reduce_only=True
+                                reduceOnly=True
                             )
-                            if close_order['ret_code'] != 0:
-                                logger.error(f"Failed to close position: {close_order['ret_msg']}")
-                                raise Exception(f"Failed to close position: {close_order['ret_msg']}")
+                            if close_order['retCode'] != 0:
+                                logger.error(f"Failed to close position: {close_order['retMsg']}")
+                                raise Exception(f"Failed to close position: {close_order['retMsg']}")
                             trade = {
                                 'timestamp': str(datetime.now(timezone.utc)),
                                 'trading_pair': TRADING_PAIR,
@@ -582,7 +582,7 @@ def on_message(ws, message):
                                 'exit_price': latest_close,
                                 'profit_loss': (latest_close - current_position['entry_price']) * current_position['size'],
                                 'trend': latest_trend,
-                                'order_id': close_order['result']['order_id']
+                                'order_id': close_order['result']['orderId']
                             }
                             trade_history.append(trade)
                             log_trade(conn, trade)
@@ -600,11 +600,11 @@ def on_message(ws, message):
                                 category="linear",
                                 symbol=BYBIT_TRADING_PAIR,
                                 side="Sell",
-                                order_type="Market",
+                                orderType="Market",
                                 qty=str(adjusted_quantity)
                             )
-                            if market_order['ret_code'] != 0:
-                                raise Exception(f"Failed to place market order: {market_order['ret_msg']}")
+                            if market_order['retCode'] != 0:
+                                raise Exception(f"Failed to place market order: {market_order['retMsg']}")
                             stop_loss_order_id = update_stop_loss(bybit_client, BYBIT_TRADING_PAIR, 'SHORT', adjusted_stop_price, None, latest_close, POSITION_SIZE)
                             current_position = {
                                 'side': 'SHORT',
@@ -613,7 +613,7 @@ def on_message(ws, message):
                                 'stop_loss': adjusted_stop_price,
                                 'trend': latest_trend,
                                 'open_time': str(datetime.now(timezone.utc)),
-                                'order_id': market_order['result']['order_id'],
+                                'order_id': market_order['result']['orderId'],
                                 'stop_loss_order_id': stop_loss_order_id
                             }
                             logger.info(
@@ -625,13 +625,13 @@ def on_message(ws, message):
                                 category="linear",
                                 symbol=BYBIT_TRADING_PAIR,
                                 side="Buy",
-                                order_type="Market",
+                                orderType="Market",
                                 qty=str(adjusted_quantity),
-                                reduce_only=True
+                                reduceOnly=True
                             )
-                            if close_order['ret_code'] != 0:
-                                logger.error(f"Failed to close position: {close_order['ret_msg']}")
-                                raise Exception(f"Failed to close position: {close_order['ret_msg']}")
+                            if close_order['retCode'] != 0:
+                                logger.error(f"Failed to close position: {close_order['retMsg']}")
+                                raise Exception(f"Failed to close position: {close_order['retMsg']}")
                             trade = {
                                 'timestamp': str(datetime.now(timezone.utc)),
                                 'trading_pair': TRADING_PAIR,
@@ -642,7 +642,7 @@ def on_message(ws, message):
                                 'exit_price': latest_close,
                                 'profit_loss': (current_position['entry_price'] - latest_close) * current_position['size'],
                                 'trend': latest_trend,
-                                'order_id': close_order['result']['order_id']
+                                'order_id': close_order['result']['orderId']
                             }
                             trade_history.append(trade)
                             log_trade(conn, trade)
@@ -660,11 +660,11 @@ def on_message(ws, message):
                                 category="linear",
                                 symbol=BYBIT_TRADING_PAIR,
                                 side="Buy",
-                                order_type="Market",
+                                orderType="Market",
                                 qty=str(adjusted_quantity)
                             )
-                            if market_order['ret_code'] != 0:
-                                raise Exception(f"Failed to place market order: {market_order['ret_msg']}")
+                            if market_order['retCode'] != 0:
+                                raise Exception(f"Failed to place market order: {market_order['retMsg']}")
                             stop_loss_order_id = update_stop_loss(bybit_client, BYBIT_TRADING_PAIR, 'LONG', adjusted_stop_price, None, latest_close, POSITION_SIZE)
                             current_position = {
                                 'side': 'LONG',
@@ -673,7 +673,7 @@ def on_message(ws, message):
                                 'stop_loss': adjusted_stop_price,
                                 'trend': latest_trend,
                                 'open_time': str(datetime.now(timezone.utc)),
-                                'order_id': market_order['result']['order_id'],
+                                'order_id': market_order['result']['orderId'],
                                 'stop_loss_order_id': stop_loss_order_id
                             }
                             logger.info(
@@ -686,18 +686,18 @@ def on_message(ws, message):
                         if current_sl is None:
                             logger.debug("Stop-loss not detected in current position. Checking Bybit directly.")
                             orders = bybit_client.get_open_orders(category="linear", symbol=BYBIT_TRADING_PAIR)
-                            if orders['ret_code'] == 0:
+                            if orders['retCode'] == 0:
                                 stop_loss_order = next(
                                     (order for order in orders['result']['list']
-                                     if order['stop_order_type'] == 'StopLoss' and
+                                     if order['stopOrderType'] == 'StopLoss' and
                                      order['side'] == ('Sell' if current_position['side'] == 'LONG' else 'Buy')),
                                     None
                                 )
                                 if stop_loss_order:
                                     logger.info(f"Found existing stop-loss order on Bybit: {stop_loss_order}")
-                                    current_sl = float(stop_loss_order['trigger_price'])
+                                    current_sl = float(stop_loss_order['triggerPrice'])
                                     current_position['stop_loss'] = current_sl
-                                    current_position['stop_loss_order_id'] = stop_loss_order['order_id']
+                                    current_position['stop_loss_order_id'] = stop_loss_order['orderId']
                         if current_sl is None or abs(current_sl - adjusted_stop_price) > epsilon:
                             new_stop_loss_order_id = update_stop_loss(bybit_client, BYBIT_TRADING_PAIR, current_position['side'],
                                                                       adjusted_stop_price,
@@ -719,13 +719,13 @@ def on_message(ws, message):
                                 category="linear",
                                 symbol=BYBIT_TRADING_PAIR,
                                 side=close_side,
-                                order_type="Market",
+                                orderType="Market",
                                 qty=str(adjusted_quantity),
-                                reduce_only=True
+                                reduceOnly=True
                             )
-                            if close_order['ret_code'] != 0:
-                                logger.error(f"Failed to close position: {close_order['ret_msg']}")
-                                raise Exception(f"Failed to close position: {close_order['ret_msg']}")
+                            if close_order['retCode'] != 0:
+                                logger.error(f"Failed to close position: {close_order['retMsg']}")
+                                raise Exception(f"Failed to close position: {close_order['retMsg']}")
                             trade = {
                                 'timestamp': str(datetime.now(timezone.utc)),
                                 'trading_pair': TRADING_PAIR,
@@ -737,7 +737,7 @@ def on_message(ws, message):
                                 'stop_loss': current_position.get('stop_loss'),
                                 'profit_loss': (latest_close - current_position['entry_price']) * current_position['size'] if current_position['side'] == 'LONG' else (current_position['entry_price'] - latest_close) * current_position['size'],
                                 'trend': latest_trend,
-                                'order_id': close_order['result']['order_id']
+                                'order_id': close_order['result']['orderId']
                             }
                             trade_history.append(trade)
                             log_trade(conn, trade)
@@ -759,11 +759,11 @@ def on_message(ws, message):
                             category="linear",
                             symbol=BYBIT_TRADING_PAIR,
                             side="Buy",
-                            order_type="Market",
+                            orderType="Market",
                             qty=str(adjusted_quantity)
                         )
-                        if market_order['ret_code'] != 0:
-                            raise Exception(f"Failed to place market order: {market_order['ret_msg']}")
+                        if market_order['retCode'] != 0:
+                            raise Exception(f"Failed to place market order: {market_order['retMsg']}")
                         stop_loss_order_id = update_stop_loss(bybit_client, BYBIT_TRADING_PAIR, 'LONG', adjusted_stop_price, None,
                                                               latest_close, POSITION_SIZE)
                         current_position = {
@@ -773,7 +773,7 @@ def on_message(ws, message):
                             'stop_loss': adjusted_stop_price,
                             'trend': latest_trend,
                             'open_time': str(datetime.now(timezone.utc)),
-                            'order_id': market_order['result']['order_id'],
+                            'order_id': market_order['result']['orderId'],
                             'stop_loss_order_id': stop_loss_order_id
                         }
                         logger.info(
@@ -783,11 +783,11 @@ def on_message(ws, message):
                             category="linear",
                             symbol=BYBIT_TRADING_PAIR,
                             side="Sell",
-                            order_type="Market",
+                            orderType="Market",
                             qty=str(adjusted_quantity)
                         )
-                        if market_order['ret_code'] != 0:
-                            raise Exception(f"Failed to place market order: {market_order['ret_msg']}")
+                        if market_order['retCode'] != 0:
+                            raise Exception(f"Failed to place market order: {market_order['retMsg']}")
                         stop_loss_order_id = update_stop_loss(bybit_client, BYBIT_TRADING_PAIR, 'SHORT', adjusted_stop_price, None,
                                                               latest_close, POSITION_SIZE)
                         current_position = {
@@ -797,7 +797,7 @@ def on_message(ws, message):
                             'stop_loss': adjusted_stop_price,
                             'trend': latest_trend,
                             'open_time': str(datetime.now(timezone.utc)),
-                            'order_id': market_order['result']['order_id'],
+                            'order_id': market_order['result']['orderId'],
                             'stop_loss_order_id': stop_loss_order_id
                         }
                         logger.info(
