@@ -864,7 +864,7 @@ def on_message(ws, message):
                         side="Sell",
                         orderType="Market",
                         qty=str(adjusted_quantity)
-                    )
+                        )
                     logger.debug(f"Market order response: {market_order}")
                     if market_order['retCode'] != 0:
                         raise Exception(f"Failed to place market order: {market_order['retMsg']}")
@@ -883,6 +883,7 @@ def on_message(ws, message):
                     logger.info(
                         f"{Fore.GREEN}Opened SHORT at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
 
+            # Sync position with Bybit
             bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
             logger.debug(f"Position sync result: {bybit_position}")
             if bybit_position:
@@ -896,6 +897,11 @@ def on_message(ws, message):
                 current_position = None
             else:
                 current_position = None
+
+            # Update current_position with the synced stop-loss and order ID
+            if bybit_position and current_position:
+                current_position['stop_loss'] = bybit_position.get('stop_loss')
+                current_position['stop_loss_order_id'] = bybit_position.get('stop_loss_order_id')
 
             logger.debug(f"Current Position: {current_position}, Latest Trend: {latest_trend}, Previous Trend: {previous_trend}")
 
