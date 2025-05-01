@@ -21,18 +21,23 @@ SCRIPT_VERSION = "2.8.4"  # Matches OKX bot version
 
 # Set up logging with dual handlers
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)  # Enable DEBUG level
-logging.getLogger('').handlers = []
+logger.setLevel(logging.DEBUG)  # Enable DEBUG level for the logger
+logging.getLogger('').handlers = []  # Clear any existing handlers
+
+# File handler (logs DEBUG and above)
 file_handler = logging.FileHandler('bybit_bot.log')
 file_handler.setLevel(logging.DEBUG)  # Log DEBUG to file
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(file_formatter)
 logger.addHandler(file_handler)
+
+# Console handler (logs INFO and above)
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)  # Log DEBUG to console
+console_handler.setLevel(logging.INFO)  # Log INFO and above to console
 console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 console_handler.setFormatter(console_formatter)
 logger.addHandler(console_handler)
+
 logger.propagate = False
 
 # Load configuration from config.json
@@ -268,18 +273,25 @@ def cancel_all_stop_loss_orders(client, symbol):
                 raise Exception(f"Failed to cancel order: {cancel_result['retMsg']}")
             logger.debug(f"Canceled stop-loss order ID: {order['orderId']}")
 
-        logger.debug("Verifying all stop-loss orders are canceled")
-        orders = client.get_open_orders(category="linear", symbol=symbol)
-        logger.debug(f"Open orders after cancellation: {orders}")
-        if orders['retCode'] != 0:
-            raise Exception(f"Failed to fetch orders after cancellation: {orders['retMsg']}")
-        remaining_orders = [order for order in orders['result']['list'] if order['stopOrderType'] == 'StopLoss']
-        if remaining_orders:
-            logger.error(f"Failed to cancel all stop-loss orders. Remaining orders: {remaining_orders}")
-            return False
+        # Verify all stop-loss orders are canceled with retries
+        max_retries = 3
+        retry_delay = 1  # seconds
+        for attempt in range(max_retries):
+            logger.debug(f"Verifying all stop-loss orders are canceled (attempt {attempt + 1}/{max_retries})")
+            orders = client.get_open_orders(category="linear", symbol=symbol)
+            logger.debug(f"Open orders after cancellation: {orders}")
+            if orders['retCode'] != 0:
+                raise Exception(f"Failed to fetch orders after cancellation: {orders['retMsg']}")
+            remaining_orders = [order for order in orders['result']['list'] if order['stopOrderType'] == 'StopLoss']
+            if not remaining_orders:
+                logger.debug(f"Successfully canceled all stop-loss orders for {symbol}")
+                return True
+            logger.warning(f"Stop-loss orders still present after cancellation, retrying in {retry_delay} seconds...")
+            time.sleep(retry_delay)
 
-        logger.debug(f"Successfully canceled all stop-loss orders for {symbol}")
-        return True
+        logger.error(f"Failed to cancel all stop-loss orders after {max_retries} attempts. Remaining orders: {remaining_orders}")
+        return False
+
     except Exception as e:
         logger.error(f"Failed to cancel stop-loss orders: {str(e)}")
         raise
@@ -351,6 +363,7 @@ def update_stop_loss(client, symbol, side, new_stop_price, current_stop_order_id
         logger.error(f"Failed to update stop-loss: {str(e)}")
         raise
 
+# Initialize SQLite database
 def init_db():
     global current_position
     conn = sqlite3.connect('bybit_trade_history.db')
@@ -606,7 +619,7 @@ def on_message(ws, message):
                     f"Trend set to -1: Close {latest_close:.10f} < ST_LINE {latest_line_st:.10f} - epsilon")
             else:
                 logger.debug(
-                    f"Trend unchanged: Close {latest_close:.10f} within epsilon of ST_LINE {latest_line_st:.10f}")
+                    f"Trend unchanged: {latest_close:.10f} within epsilon of {latest_line_st:.10f}")
 
             stop_loss = latest_line_st - STOP_LOSS_OFFSET if latest_trend == 1 else latest_line_st + STOP_LOSS_OFFSET
             logger.debug(f"Calculated stop_loss: latest_line_st={latest_line_st}, STOP_LOSS_OFFSET={STOP_LOSS_OFFSET}, stop_loss={stop_loss}")
@@ -684,6 +697,13 @@ def on_message(ws, message):
                         logger.info(
                             f"{Fore.GREEN}Reversed to SHORT at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
 
+                        # Sync position to get the actual fill price
+                        bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
+                        if bybit_position:
+                            current_position['entry_price'] = bybit_position['entry_price']
+                            current_position['stop_loss'] = bybit_position.get('stop_loss')
+                            current_position['stop_loss_order_id'] = bybit_position.get('stop_loss_order_id')
+
                     elif current_position['side'] == 'SHORT' and latest_trend == 1:
                         cancel_all_stop_loss_orders(bybit_client, BYBIT_TRADING_PAIR)
                         logger.debug("Attempting to close SHORT position")
@@ -747,6 +767,13 @@ def on_message(ws, message):
                         }
                         logger.info(
                             f"{Fore.GREEN}Reversed to LONG at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+
+                        # Sync position to get the actual fill price
+                        bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
+                        if bybit_position:
+                            current_position['entry_price'] = bybit_position['entry_price']
+                            current_position['stop_loss'] = bybit_position.get('stop_loss')
+                            current_position['stop_loss_order_id'] = bybit_position.get('stop_loss_order_id')
 
                 elif current_position['side'] == ('LONG' if latest_trend == 1 else 'SHORT'):
                     logger.debug(f"Current SL: {current_position.get('stop_loss')}, Adjusted SL: {adjusted_stop_price}")
@@ -855,6 +882,14 @@ def on_message(ws, message):
                     }
                     logger.info(
                         f"{Fore.GREEN}Opened LONG at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+
+                    # Sync position to get the actual fill price
+                    bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
+                    if bybit_position:
+                        current_position['entry_price'] = bybit_position['entry_price']
+                        current_position['stop_loss'] = bybit_position.get('stop_loss')
+                        current_position['stop_loss_order_id'] = bybit_position.get('stop_loss_order_id')
+
                 elif latest_trend == -1:
                     logger.debug("Opening SHORT position")
                     market_order = bybit_client.place_order(
@@ -863,7 +898,7 @@ def on_message(ws, message):
                         side="Sell",
                         orderType="Market",
                         qty=str(adjusted_quantity)
-                        )
+                    )
                     logger.debug(f"Market order response: {market_order}")
                     if market_order['retCode'] != 0:
                         raise Exception(f"Failed to place market order: {market_order['retMsg']}")
@@ -881,6 +916,13 @@ def on_message(ws, message):
                     }
                     logger.info(
                         f"{Fore.GREEN}Opened SHORT at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+
+                    # Sync position to get the actual fill price
+                    bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
+                    if bybit_position:
+                        current_position['entry_price'] = bybit_position['entry_price']
+                        current_position['stop_loss'] = bybit_position.get('stop_loss')
+                        current_position['stop_loss_order_id'] = bybit_position.get('stop_loss_order_id')
 
             # Sync position with Bybit
             bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
