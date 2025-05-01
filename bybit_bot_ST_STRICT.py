@@ -345,7 +345,7 @@ def update_stop_loss(client, symbol, side, new_stop_price, current_stop_order_id
             raise Exception(f"Failed to set stop-loss: {response['retMsg']}")
 
         logger.info(f"{Fore.YELLOW}Updated stop-loss to {new_stop_price:.2f}{Style.RESET_ALL}")
-        return current_stop_order_id  # Return the existing order ID (or None if it was reset)
+        return current_stop_order_id  # Return the existing order ID (or None if reset)
 
     except Exception as e:
         logger.error(f"Failed to update stop-loss: {str(e)}")
@@ -554,16 +554,12 @@ def on_message(ws, message):
             'close': [float(kline['c'])],
             'volume': [float(kline['v'])]
         })
-        logger.debug(f"New kline row: {new_row.to_dict()}")
 
         if not kline_data.empty and kline_data['timestamp'].iloc[-1] == new_row['timestamp'].iloc[0]:
             kline_data.iloc[-1] = new_row.iloc[0]
-            logger.debug("Updated existing kline row")
         else:
             kline_data = pd.concat([kline_data, new_row], ignore_index=True)
-            logger.debug("Appended new kline row")
         kline_data = kline_data.tail(2000)
-        logger.debug(f"kline_data size after update: {len(kline_data)}")
 
         if not first_closed_candle_received and kline['x']:
             first_closed_candle_received = True
