@@ -363,7 +363,6 @@ def update_stop_loss(client, symbol, side, new_stop_price, current_stop_order_id
         logger.error(f"Failed to update stop-loss: {str(e)}")
         raise
 
-# Initialize SQLite database
 def init_db():
     global current_position
     conn = sqlite3.connect('bybit_trade_history.db')
