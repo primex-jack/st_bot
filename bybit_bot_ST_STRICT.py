@@ -25,7 +25,7 @@ logger.setLevel(logging.DEBUG)  # Enable DEBUG level for the logger
 logging.getLogger('').handlers = []  # Clear any existing handlers
 
 # File handler (logs DEBUG and above)
-file_handler = logging.FileHandler('bybit_bot.log')
+file_handler = logging.FileHandler('bot.log')
 file_handler.setLevel(logging.DEBUG)  # Log DEBUG to file
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(file_formatter)
@@ -80,7 +80,7 @@ def load_config():
         }
 
 # Write PID to file and log startup
-with open('bybit_bot.pid', 'w') as f:
+with open('bot.pid', 'w') as f:
     pid = os.getpid()
     f.write(str(pid))
 logger.info(f"{Fore.CYAN}Bot started with PID {pid} at {datetime.now(timezone.utc)}{Style.RESET_ALL}")
