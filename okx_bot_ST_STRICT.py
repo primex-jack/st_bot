@@ -28,7 +28,7 @@ SCRIPT_VERSION = "2.8.5"  # Updated to 2.8.5 for stop-loss handling update (Opti
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 logging.getLogger('').handlers = []
-file_handler = logging.FileHandler('okx_bot.log')
+file_handler = logging.FileHandler('bot.log')
 file_handler.setLevel(logging.DEBUG)
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(file_formatter)
