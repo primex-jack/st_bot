@@ -19,13 +19,7 @@ import hashlib
 init()
 
 # Script Version
-# Versioning Scheme: MAJOR.MINOR.PATCH
-# - MAJOR: Incremented for significant changes, new features, or breaking changes.
-# - MINOR: Incremented for additional functionalities or enhancements that are backward-compatible.
-# - PATCH: Incremented for bug fixes or minor updates that don’t add new features.
-# Example: Version 1.3.1 means 1 major version, 3 minor updates, 1 patch fix.
-# When a bug is fixed or a minor enhancement is made, the next version is e.g., 1.3.2.
-SCRIPT_VERSION = "2.8.2"  # Updated to 2.8.2 for bug fix: increased historical data fetching for accurate SuperTrend calculation
+SCRIPT_VERSION = "2.8.3"  # Updated to 2.8.3 for stop-loss handling and position sync fixes
 
 # Set up logging with dual handlers
 logger = logging.getLogger(__name__)
@@ -248,6 +242,7 @@ def cancel_all_stop_loss_orders(client, symbol):
 # Update stop-loss order on Binance with retry logic
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 def update_stop_loss(client, symbol, side, new_stop_price, current_stop_order_id, current_price):
+    global current_position
     try:
         symbol_config = load_symbol_config(symbol, client)
         new_stop_price = adjust_price(new_stop_price, symbol_config)
@@ -258,8 +253,20 @@ def update_stop_loss(client, symbol, side, new_stop_price, current_stop_order_id
             new_stop_price = current_price + 0.01
 
         if current_stop_order_id:
-            if not cancel_all_stop_loss_orders(client, symbol):
-                raise Exception("Failed to cancel existing stop-loss orders")
+            try:
+                cancel_result = client.cancel_order(symbol=symbol, orderId=current_stop_order_id)
+                logger.debug(f"Cancel stop-loss order response: {cancel_result}")
+            except Exception as e:
+                if "Unknown order sent" in str(e):
+                    logger.warning(f"Stop-loss order ID {current_stop_order_id} not found on Binance. Proceeding to set new stop-loss.")
+                else:
+                    logger.error(f"Failed to cancel stop-loss order: {str(e)}")
+                    if not cancel_all_stop_loss_orders(client, symbol):
+                        raise Exception("Failed to cancel existing stop-loss orders")
+
+        if current_position is None:
+            logger.warning(f"No position exists to set stop-loss for {symbol}. Skipping.")
+            return None
 
         stop_order = client.new_order(
             symbol=symbol,
@@ -274,6 +281,10 @@ def update_stop_loss(client, symbol, side, new_stop_price, current_stop_order_id
         logger.info(f"Placed new stop-loss order ID: {stop_order['orderId']} at {new_stop_price}")
         return stop_order['orderId']
     except Exception as e:
+        if "Position does not exist" in str(e):
+            logger.warning(f"No position exists to set stop-loss for {symbol}. Clearing local state.")
+            current_position = None
+            return None
         logger.error(f"Failed to update stop-loss: {str(e)}")
         raise
 
@@ -326,6 +337,7 @@ def init_db():
         logger.info("No active position found on Binance or in database")
 
     return conn
+
 # Log trade to database
 def log_trade(conn, trade):
     c = conn.cursor()
@@ -453,239 +465,380 @@ def on_message(ws, message):
     global kline_data, first_closed_candle_received, first_closed_timestamp, closed_candle_count, historical_data_fetched, current_position, trade_history, conn, previous_trend
     try:
         data = json.loads(message)
-        if 'data' in data and 'k' in data['data']:
-            kline = data['data']['k']
-            new_row = pd.DataFrame({
-                'timestamp': [pd.to_datetime(int(kline['t']), unit='ms')],
-                'open': [float(kline['o'])],
-                'high': [float(kline['h'])],
-                'low': [float(kline['l'])],
-                'close': [float(kline['c'])],
-                'volume': [float(kline['v'])]
-            })
+        if 'data' not in data or 'k' not in data['data']:
+            logger.debug("Message does not contain kline data, skipping")
+            return
 
-            if not kline_data.empty and kline_data['timestamp'].iloc[-1] == new_row['timestamp'].iloc[0]:
-                kline_data.iloc[-1] = new_row.iloc[0]
+        kline = data['data']['k']
+        new_row = pd.DataFrame({
+            'timestamp': [pd.to_datetime(int(kline['t']), unit='ms')],
+            'open': [float(kline['o'])],
+            'high': [float(kline['h'])],
+            'low': [float(kline['l'])],
+            'close': [float(kline['c'])],
+            'volume': [float(kline['v'])]
+        })
+
+        if not kline_data.empty and kline_data['timestamp'].iloc[-1] == new_row['timestamp'].iloc[0]:
+            kline_data.iloc[-1] = new_row.iloc[0]
+        else:
+            kline_data = pd.concat([kline_data, new_row], ignore_index=True)
+        kline_data = kline_data.tail(2000)
+
+        if not first_closed_candle_received and kline['x']:
+            first_closed_candle_received = True
+            first_closed_timestamp = kline['t']
+            logger.info(
+                f"{Fore.CYAN}First closed candle received at timestamp: {first_closed_timestamp}{Style.RESET_ALL}")
+            fetch_historical_data(limit=1000, end_time=int(first_closed_timestamp) - 1, num_batches=2)
+
+        if kline['x']:
+            if len(kline_data) >= ATR_PERIOD:
+                closed_candle_count += 1
+                logger.info(f"{Fore.CYAN}Closed candle count: {closed_candle_count}{Style.RESET_ALL}")
+                logger.info(f"{Fore.CYAN}Bar Closed - Close: {new_row['close'].iloc[0]:.2f}{Style.RESET_ALL}")
             else:
-                kline_data = pd.concat([kline_data, new_row], ignore_index=True)
-            kline_data = kline_data.tail(2000)  # Keep up to 2000 candles
+                logger.warning(
+                    f"{Fore.YELLOW}Insufficient data: {len(kline_data)} candles, need at least {ATR_PERIOD}{Style.RESET_ALL}")
+                return
 
-            if not first_closed_candle_received and kline['x']:
-                first_closed_candle_received = True
-                first_closed_timestamp = kline['t']
-                logger.info(
-                    f"{Fore.CYAN}First closed candle received at timestamp: {first_closed_timestamp}{Style.RESET_ALL}")
-                fetch_historical_data(limit=1000, end_time=int(first_closed_timestamp) - 1, num_batches=2)
+            df = kline_data.copy()
+            df.set_index('timestamp', inplace=True)
 
-            if kline['x']:
-                if len(kline_data) >= ATR_PERIOD:
-                    closed_candle_count += 1
-                    logger.info(f"{Fore.CYAN}Closed candle count: {closed_candle_count}{Style.RESET_ALL}")
-                    logger.info(f"{Fore.CYAN}Bar Closed - Close: {new_row['close'].iloc[0]:.2f}{Style.RESET_ALL}")
-                else:
+            # Define epsilon here for use in logging
+            epsilon = 1e-5  # Match the value used in calculate_supertrend
+
+            line_st, trend = calculate_supertrend(df, ATR_PERIOD, ATR_RATIO)
+            latest_line_st = line_st.iloc[-1]
+            latest_trend = trend.iloc[-1]
+            latest_close = df['close'].iloc[-1]
+
+            # Log close, ST_LINE, and trend
+            logger.debug(f"Close: {latest_close:.10f}, ST_LINE: {latest_line_st:.10f}, Trend: {latest_trend}")
+
+            # Log trend flips
+            if previous_trend is not None and latest_trend != previous_trend:
+                logger.info(f"Trend flipped from {previous_trend} to {latest_trend}")
+
+            # Log ATR and ATR_SMMA periodically
+            if closed_candle_count % 10 == 0:  # Every 10 candles
+                atr = calculate_atr(df, ATR_PERIOD)
+                atr_smma = calculate_ema(atr, ATR_PERIOD)
+                logger.debug(f"ATR: {atr.iloc[-1]:.10f}, ATR_SMMA: {atr_smma.iloc[-1]:.10f}")
+
+            # Log comparison details
+            line_st_current = latest_line_st
+            if latest_close > line_st_current + epsilon:
+                logger.debug(
+                    f"Trend set to 1: Close {latest_close:.10f} > ST_LINE {line_st_current:.10f} + epsilon")
+            elif latest_close < line_st_current - epsilon:
+                logger.debug(
+                    f"Trend set to -1: Close {latest_close:.10f} < ST_LINE {line_st_current:.10f} - epsilon")
+            else:
+                logger.debug(
+                    f"Trend unchanged: Close {latest_close:.10f} within epsilon of ST_LINE {line_st_current:.10f}")
+
+            stop_loss = latest_line_st - STOP_LOSS_OFFSET if latest_trend == 1 else latest_line_st + STOP_LOSS_OFFSET
+            symbol_config = load_symbol_config(TRADING_PAIR, client)
+            adjusted_quantity = adjust_quantity(POSITION_SIZE, symbol_config, latest_close)
+            adjusted_stop_price = adjust_price(stop_loss, symbol_config)
+
+            # Sync position with Binance before making decisions
+            binance_position = sync_position_with_binance(client, TRADING_PAIR)
+            logger.debug(f"Position sync result: {binance_position}")
+            if binance_position:
+                if not current_position or current_position['side'] != binance_position['side'] or abs(
+                        current_position['size'] - binance_position['size']) > 0.0001:
                     logger.warning(
-                        f"{Fore.YELLOW}Insufficient data: {len(kline_data)} candles, need at least {ATR_PERIOD}{Style.RESET_ALL}")
+                        f"{Fore.YELLOW}Position mismatch detected. Updating from Binance: {binance_position}{Style.RESET_ALL}")
+                    current_position = binance_position
+            elif binance_position is None and current_position:
+                logger.warning("No position on Binance. Clearing local state.")
+                current_position = None
+            else:
+                current_position = None
 
-                df = kline_data.copy()
-                df.set_index('timestamp', inplace=True)
+            # Update current_position with the synced stop-loss and order ID
+            if binance_position and current_position:
+                current_position['stop_loss'] = binance_position.get('stop_loss')
+                current_position['stop_loss_order_id'] = binance_position.get('stop_loss_order_id')
 
-                # Define epsilon here for use in logging
-                epsilon = 1e-5  # Match the value used in calculate_supertrend
-
-                line_st, trend = calculate_supertrend(df, ATR_PERIOD, ATR_RATIO)
-                latest_line_st = line_st.iloc[-1]
-                latest_trend = trend.iloc[-1]
-                latest_close = df['close'].iloc[-1]
-
-                # Log close, ST_LINE, and trend
-                logger.debug(f"Close: {latest_close:.10f}, ST_LINE: {latest_line_st:.10f}, Trend: {latest_trend}")
-
-                # Log trend flips
-                if previous_trend is not None and latest_trend != previous_trend:
-                    logger.info(f"Trend flipped from {previous_trend} to {latest_trend}")
-
-                # Log ATR and ATR_SMMA periodically
-                if closed_candle_count % 10 == 0:  # Every 10 candles
-                    atr = calculate_atr(df, ATR_PERIOD)
-                    atr_smma = calculate_ema(atr, ATR_PERIOD)
-                    logger.debug(f"ATR: {atr.iloc[-1]:.10f}, ATR_SMMA: {atr_smma.iloc[-1]:.10f}")
-
-                # Log comparison details
-                line_st_current = latest_line_st
-                if latest_close > line_st_current + epsilon:
-                    logger.debug(
-                        f"Trend set to 1: Close {latest_close:.10f} > ST_LINE {line_st_current:.10f} + epsilon")
-                elif latest_close < line_st_current - epsilon:
-                    logger.debug(
-                        f"Trend set to -1: Close {latest_close:.10f} < ST_LINE {line_st_current:.10f} - epsilon")
-                else:
-                    logger.debug(
-                        f"Trend unchanged: Close {latest_close:.10f} within epsilon of ST_LINE {line_st_current:.10f}")
-
-                stop_loss = latest_line_st - STOP_LOSS_OFFSET if latest_trend == 1 else latest_line_st + STOP_LOSS_OFFSET
-                symbol_config = load_symbol_config(TRADING_PAIR, client)
-                adjusted_quantity = adjust_quantity(POSITION_SIZE, symbol_config, latest_close)
-                adjusted_stop_price = adjust_price(stop_loss, symbol_config)
-
-                if current_position:
+            if current_position:
+                position_trend = 1 if current_position['side'] == 'LONG' else -1
+                logger.debug(f"Current position: side={current_position['side']}, position_trend={position_trend}, latest_trend={latest_trend}")
+                if position_trend != latest_trend:
+                    logger.info(f"Position trend mismatch detected: Position {current_position['side']} (trend {position_trend}), Indicator trend {latest_trend}. Flipping position.")
                     if current_position['side'] == 'LONG' and latest_trend == -1:
                         cancel_all_stop_loss_orders(client, TRADING_PAIR)
-                        close_order = client.new_order(symbol=TRADING_PAIR, side='SELL', type='MARKET',
-                                                       quantity=current_position['size'])
-                        trade = {
-                            'timestamp': str(datetime.now(timezone.utc)),
-                            'trading_pair': TRADING_PAIR,
-                            'timeframe': TIMEFRAME,
-                            'side': 'LONG',
-                            'entry_price': current_position['entry_price'],
-                            'size': current_position['size'],
-                            'exit_price': latest_close,
-                            'profit_loss': (latest_close - current_position['entry_price']) * current_position['size'],
-                            'trend': latest_trend,
-                            'order_id': close_order['orderId']
-                        }
-                        trade_history.append(trade)
-                        log_trade(conn, trade)
-                        market_order = client.new_order(symbol=TRADING_PAIR, side='SELL', type='MARKET',
-                                                        quantity=adjusted_quantity)
-                        stop_loss_order_id = update_stop_loss(client, TRADING_PAIR, 'SHORT', adjusted_stop_price, None,
-                                                              latest_close)
-                        current_position = {
-                            'side': 'SHORT',
-                            'entry_price': latest_close,
-                            'size': adjusted_quantity,
-                            'stop_loss': adjusted_stop_price,
-                            'trend': latest_trend,
-                            'open_time': str(datetime.now(timezone.utc)),
-                            'order_id': market_order['orderId'],
-                            'stop_loss_order_id': stop_loss_order_id
-                        }
-                        logger.info(
-                            f"{Fore.GREEN}Reversed to SHORT at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+                        logger.debug("Attempting to close LONG position")
+                        try:
+                            close_order = client.new_order(
+                                symbol=TRADING_PAIR,
+                                side='SELL',
+                                type='MARKET',
+                                quantity=current_position['size']
+                            )
+                            logger.debug(f"Close position response: {close_order}")
+                        except Exception as e:
+                            if "Position does not exist" in str(e) or "Order does not exist" in str(e):
+                                logger.warning(f"Position already closed on Binance. Clearing local state.")
+                                current_position = None
+                            else:
+                                logger.error(f"Failed to close position: {str(e)}")
+                                raise e
 
-                    elif current_position['side'] == 'SHORT' and latest_trend == 1:
-                        cancel_all_stop_loss_orders(client, TRADING_PAIR)
-                        close_order = client.new_order(symbol=TRADING_PAIR, side='BUY', type='MARKET',
-                                                       quantity=current_position['size'])
-                        trade = {
-                            'timestamp': str(datetime.now(timezone.utc)),
-                            'trading_pair': TRADING_PAIR,
-                            'timeframe': TIMEFRAME,
-                            'side': 'SHORT',
-                            'entry_price': current_position['entry_price'],
-                            'size': current_position['size'],
-                            'exit_price': latest_close,
-                            'profit_loss': (current_position['entry_price'] - latest_close) * current_position['size'],
-                            'trend': latest_trend,
-                            'order_id': close_order['orderId']
-                        }
-                        trade_history.append(trade)
-                        log_trade(conn, trade)
-                        market_order = client.new_order(symbol=TRADING_PAIR, side='BUY', type='MARKET',
-                                                        quantity=adjusted_quantity)
-                        stop_loss_order_id = update_stop_loss(client, TRADING_PAIR, 'LONG', adjusted_stop_price, None,
-                                                              latest_close)
-                        current_position = {
-                            'side': 'LONG',
-                            'entry_price': latest_close,
-                            'size': adjusted_quantity,
-                            'stop_loss': adjusted_stop_price,
-                            'trend': latest_trend,
-                            'open_time': str(datetime.now(timezone.utc)),
-                            'order_id': market_order['orderId'],
-                            'stop_loss_order_id': stop_loss_order_id
-                        }
-                        logger.info(
-                            f"{Fore.GREEN}Reversed to LONG at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
-
-                    elif current_position['side'] == ('LONG' if latest_trend == 1 else 'SHORT'):
-                        logger.debug(f"Current SL: {current_position.get('stop_loss')}, Adjusted SL: {adjusted_stop_price}")
-                        if current_position.get('stop_loss') != adjusted_stop_price:
-                            new_stop_loss_order_id = update_stop_loss(client, TRADING_PAIR, current_position['side'],
-                                                                      adjusted_stop_price,
-                                                                      current_position.get('stop_loss_order_id'),
-                                                                      latest_close)
-                            if new_stop_loss_order_id:
-                                current_position['stop_loss'] = adjusted_stop_price
-                                current_position['stop_loss_order_id'] = new_stop_loss_order_id
-                                logger.info(f"{Fore.YELLOW}Updated stop-loss to {adjusted_stop_price:.2f}{Style.RESET_ALL}")
-
-                    if current_position and current_position.get('stop_loss') is not None:
-                        if (current_position['side'] == 'LONG' and latest_close <= current_position['stop_loss']) or \
-                           (current_position['side'] == 'SHORT' and latest_close >= current_position['stop_loss']):
+                        if current_position is not None:
                             trade = {
                                 'timestamp': str(datetime.now(timezone.utc)),
                                 'trading_pair': TRADING_PAIR,
                                 'timeframe': TIMEFRAME,
-                                'side': current_position['side'],
+                                'side': 'LONG',
                                 'entry_price': current_position['entry_price'],
                                 'size': current_position['size'],
                                 'exit_price': latest_close,
-                                'stop_loss': current_position.get('stop_loss'),
-                                'profit_loss': (latest_close - current_position['entry_price']) * current_position['size'] if current_position['side'] == 'LONG' else (current_position['entry_price'] - latest_close) * current_position['size'],
+                                'profit_loss': (latest_close - current_position['entry_price']) * current_position['size'],
                                 'trend': latest_trend,
-                                'order_id': current_position.get('order_id'),
-                                'stop_loss_order_id': current_position.get('stop_loss_order_id')
+                                'order_id': close_order['orderId']
                             }
                             trade_history.append(trade)
                             log_trade(conn, trade)
+                            binance_position = sync_position_with_binance(client, TRADING_PAIR)
+                            if not binance_position:
+                                logger.info("Position successfully closed. Opening new SHORT position.")
+                                current_position = None
+                            else:
+                                logger.warning(f"Position still exists after closing attempt: {binance_position}")
+                                current_position = binance_position
+                                display_trade_summary(current_position, latest_close, latest_line_st)
+                                return
+
+                        if current_position is None:
+                            logger.debug("Opening new SHORT position")
+                            market_order = client.new_order(
+                                symbol=TRADING_PAIR,
+                                side='SELL',
+                                type='MARKET',
+                                quantity=adjusted_quantity
+                            )
+                            stop_loss_order_id = update_stop_loss(client, TRADING_PAIR, 'SHORT', adjusted_stop_price, None,
+                                                                  latest_close)
+                            current_position = {
+                                'side': 'SHORT',
+                                'entry_price': latest_close,
+                                'size': adjusted_quantity,
+                                'stop_loss': adjusted_stop_price,
+                                'trend': latest_trend,
+                                'open_time': str(datetime.now(timezone.utc)),
+                                'order_id': market_order['orderId'],
+                                'stop_loss_order_id': stop_loss_order_id
+                            }
                             logger.info(
-                                f"{Fore.RED}Stop-loss triggered: Closed {current_position['side']} at {latest_close:.2f}, P/L: {trade['profit_loss']:.2f} USDT{Style.RESET_ALL}")
+                                f"{Fore.GREEN}Reversed to SHORT at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+
+                    elif current_position['side'] == 'SHORT' and latest_trend == 1:
+                        cancel_all_stop_loss_orders(client, TRADING_PAIR)
+                        logger.debug("Attempting to close SHORT position")
+                        try:
+                            close_order = client.new_order(
+                                symbol=TRADING_PAIR,
+                                side='BUY',
+                                type='MARKET',
+                                quantity=current_position['size']
+                            )
+                            logger.debug(f"Close position response: {close_order}")
+                        except Exception as e:
+                            if "Position does not exist" in str(e) or "Order does not exist" in str(e):
+                                logger.warning(f"Position already closed on Binance. Clearing local state.")
+                                current_position = None
+                            else:
+                                logger.error(f"Failed to close position: {str(e)}")
+                                raise e
+
+                        if current_position is not None:
+                            trade = {
+                                'timestamp': str(datetime.now(timezone.utc)),
+                                'trading_pair': TRADING_PAIR,
+                                'timeframe': TIMEFRAME,
+                                'side': 'SHORT',
+                                'entry_price': current_position['entry_price'],
+                                'size': current_position['size'],
+                                'exit_price': latest_close,
+                                'profit_loss': (current_position['entry_price'] - latest_close) * current_position['size'],
+                                'trend': latest_trend,
+                                'order_id': close_order['orderId']
+                            }
+                            trade_history.append(trade)
+                            log_trade(conn, trade)
+                            binance_position = sync_position_with_binance(client, TRADING_PAIR)
+                            if not binance_position:
+                                logger.info("Position successfully closed. Opening new LONG position.")
+                                current_position = None
+                            else:
+                                logger.warning(f"Position still exists after closing attempt: {binance_position}")
+                                current_position = binance_position
+                                display_trade_summary(current_position, latest_close, latest_line_st)
+                                return
+
+                        if current_position is None:
+                            logger.debug("Opening new LONG position")
+                            market_order = client.new_order(
+                                symbol=TRADING_PAIR,
+                                side='BUY',
+                                type='MARKET',
+                                quantity=adjusted_quantity
+                            )
+                            stop_loss_order_id = update_stop_loss(client, TRADING_PAIR, 'LONG', adjusted_stop_price, None,
+                                                                  latest_close)
+                            current_position = {
+                                'side': 'LONG',
+                                'entry_price': latest_close,
+                                'size': adjusted_quantity,
+                                'stop_loss': adjusted_stop_price,
+                                'trend': latest_trend,
+                                'open_time': str(datetime.now(timezone.utc)),
+                                'order_id': market_order['orderId'],
+                                'stop_loss_order_id': stop_loss_order_id
+                            }
+                            logger.info(
+                                f"{Fore.GREEN}Reversed to LONG at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+
+                elif current_position['side'] == ('LONG' if latest_trend == 1 else 'SHORT'):
+                    logger.debug(f"Current SL: {current_position.get('stop_loss')}, Adjusted SL: {adjusted_stop_price}")
+                    epsilon = 1e-5
+                    current_sl = current_position.get('stop_loss')
+                    if current_sl is None:
+                        logger.debug("Stop-loss not detected in current position. Checking Binance directly.")
+                        orders = fetch_open_orders(TRADING_PAIR, API_KEY, API_SECRET)
+                        logger.debug(f"Open orders for stop-loss check: {orders}")
+                        stop_loss_order = next(
+                            (order for order in orders
+                             if order['type'] == 'STOP_MARKET' and
+                             order.get('reduceOnly', False) and
+                             order.get('closePosition', False) and
+                             ((current_position['side'] == 'LONG' and order['side'] == 'SELL') or
+                              (current_position['side'] == 'SHORT' and order['side'] == 'BUY'))),
+                            None
+                        )
+                        if stop_loss_order:
+                            logger.info(f"Found existing stop-loss order on Binance: {stop_loss_order}")
+                            current_sl = float(stop_loss_order['stopPrice'])
+                            current_position['stop_loss'] = current_sl
+                            current_position['stop_loss_order_id'] = stop_loss_order['orderId']
+                    if current_sl is None or abs(current_sl - adjusted_stop_price) > epsilon:
+                        new_stop_loss_order_id = update_stop_loss(client, TRADING_PAIR, current_position['side'],
+                                                                  adjusted_stop_price,
+                                                                  current_position.get('stop_loss_order_id'),
+                                                                  latest_close)
+                        if new_stop_loss_order_id:
+                            current_position['stop_loss'] = adjusted_stop_price
+                            current_position['stop_loss_order_id'] = new_stop_loss_order_id
+                            logger.info(f"{Fore.YELLOW}Updated stop-loss to {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+                    else:
+                        logger.debug(f"Stop-loss unchanged: {current_sl:.2f} (within epsilon of {adjusted_stop_price:.2f})")
+
+                if current_position and current_position.get('stop_loss') is not None:
+                    logger.debug(f"Checking stop-loss trigger: side={current_position['side']}, latest_close={latest_close}, stop_loss={current_position['stop_loss']}")
+                    if (current_position['side'] == 'LONG' and latest_close <= current_position['stop_loss']) or \
+                       (current_position['side'] == 'SHORT' and latest_close >= current_position['stop_loss']):
+                        logger.debug("Stop-loss triggered, closing position")
+                        cancel_all_stop_loss_orders(client, TRADING_PAIR)
+                        close_side = 'SELL' if current_position['side'] == 'LONG' else 'BUY'
+                        previous_side = current_position['side']  # Store the side before closing
+                        try:
+                            close_order = client.new_order(
+                                symbol=TRADING_PAIR,
+                                side=close_side,
+                                type='MARKET',
+                                quantity=current_position['size']
+                            )
+                            logger.debug(f"Close position response: {close_order}")
+                        except Exception as e:
+                            if "Position does not exist" in str(e) or "Order does not exist" in str(e):
+                                logger.warning(f"Position already closed on Binance (stop-loss likely triggered). Clearing local state.")
+                            else:
+                                logger.error(f"Failed to close position: {str(e)}")
+                                raise e
+
+                        trade = {
+                            'timestamp': str(datetime.now(timezone.utc)),
+                            'trading_pair': TRADING_PAIR,
+                            'timeframe': TIMEFRAME,
+                            'side': previous_side,
+                            'entry_price': current_position['entry_price'],
+                            'size': current_position['size'],
+                            'exit_price': latest_close,
+                            'stop_loss': current_position.get('stop_loss'),
+                            'profit_loss': (latest_close - current_position['entry_price']) * current_position['size'] if previous_side == 'LONG' else (current_position['entry_price'] - latest_close) * current_position['size'],
+                            'trend': latest_trend,
+                            'order_id': close_order.get('orderId', current_position.get('order_id')),
+                            'stop_loss_order_id': current_position.get('stop_loss_order_id')
+                        }
+                        trade_history.append(trade)
+                        log_trade(conn, trade)
+                        logger.info(
+                            f"{Fore.RED}Stop-loss triggered: Closed {previous_side} at {latest_close:.2f}, P/L: {trade['profit_loss']:.2f} USDT{Style.RESET_ALL}")
+                        binance_position = sync_position_with_binance(client, TRADING_PAIR)
+                        if not binance_position:
+                            logger.info("Position successfully closed. Awaiting manual intervention to resume trading.")
                             current_position = None
+                        else:
+                            logger.warning(f"Position still exists after stop-loss trigger: {binance_position}")
+                            current_position = binance_position
+                            display_trade_summary(current_position, latest_close, latest_line_st)
+                            return
 
-                binance_position = sync_position_with_binance(client, TRADING_PAIR)
-                if binance_position:
-                    if not current_position or current_position['side'] != binance_position['side'] or abs(
-                            current_position['size'] - binance_position['size']) > 0.0001:
-                        logger.warning(
-                            f"{Fore.YELLOW}Position mismatch detected. Updating from Binance: {binance_position}{Style.RESET_ALL}")
-                        current_position = binance_position
-                elif binance_position is None and current_position:
-                    logger.debug("No position on Binance, retaining current_position unless closed")
-                else:
-                    current_position = None
+            if not current_position and ((force_first_trade and closed_candle_count == 1) or (
+                    previous_trend is not None and previous_trend != latest_trend)):
+                logger.debug(f"Opening new position: force_first_trade={force_first_trade}, closed_candle_count={closed_candle_count}, previous_trend={previous_trend}, latest_trend={latest_trend}")
+                if latest_trend == 1:
+                    logger.debug("Opening LONG position")
+                    market_order = client.new_order(
+                        symbol=TRADING_PAIR,
+                        side='BUY',
+                        type='MARKET',
+                        quantity=adjusted_quantity
+                    )
+                    stop_loss_order_id = update_stop_loss(client, TRADING_PAIR, 'LONG', adjusted_stop_price, None,
+                                                          latest_close)
+                    current_position = {
+                        'side': 'LONG',
+                        'entry_price': latest_close,
+                        'size': adjusted_quantity,
+                        'stop_loss': adjusted_stop_price,
+                        'trend': latest_trend,
+                        'open_time': str(datetime.now(timezone.utc)),
+                        'order_id': market_order['orderId'],
+                        'stop_loss_order_id': stop_loss_order_id
+                    }
+                    logger.info(
+                        f"{Fore.GREEN}Opened LONG at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+                elif latest_trend == -1:
+                    logger.debug("Opening SHORT position")
+                    market_order = client.new_order(
+                        symbol=TRADING_PAIR,
+                        side='SELL',
+                        type='MARKET',
+                        quantity=adjusted_quantity
+                    )
+                    stop_loss_order_id = update_stop_loss(client, TRADING_PAIR, 'SHORT', adjusted_stop_price, None,
+                                                          latest_close)
+                    current_position = {
+                        'side': 'SHORT',
+                        'entry_price': latest_close,
+                        'size': adjusted_quantity,
+                        'stop_loss': adjusted_stop_price,
+                        'trend': latest_trend,
+                        'open_time': str(datetime.now(timezone.utc)),
+                        'order_id': market_order['orderId'],
+                        'stop_loss_order_id': stop_loss_order_id
+                    }
+                    logger.info(
+                        f"{Fore.GREEN}Opened SHORT at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
 
-                logger.debug(f"Current Position: {current_position}, Latest Trend: {latest_trend}, Previous Trend: {previous_trend}")
+            logger.debug(f"Current Position: {current_position}, Latest Trend: {latest_trend}, Previous Trend: {previous_trend}")
 
-                if not current_position and ((force_first_trade and closed_candle_count == 1) or (
-                        previous_trend is not None and previous_trend != latest_trend)):
-                    if latest_trend == 1:
-                        market_order = client.new_order(symbol=TRADING_PAIR, side='BUY', type='MARKET',
-                                                        quantity=adjusted_quantity)
-                        stop_loss_order_id = update_stop_loss(client, TRADING_PAIR, 'LONG', adjusted_stop_price, None,
-                                                              latest_close)
-                        current_position = {
-                            'side': 'LONG',
-                            'entry_price': latest_close,
-                            'size': adjusted_quantity,
-                            'stop_loss': adjusted_stop_price,
-                            'trend': latest_trend,
-                            'open_time': str(datetime.now(timezone.utc)),
-                            'order_id': market_order['orderId'],
-                            'stop_loss_order_id': stop_loss_order_id
-                        }
-                        logger.info(
-                            f"{Fore.GREEN}Opened LONG at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
-                    elif latest_trend == -1:
-                        market_order = client.new_order(symbol=TRADING_PAIR, side='SELL', type='MARKET',
-                                                        quantity=adjusted_quantity)
-                        stop_loss_order_id = update_stop_loss(client, TRADING_PAIR, 'SHORT', adjusted_stop_price, None,
-                                                              latest_close)
-                        current_position = {
-                            'side': 'SHORT',
-                            'entry_price': latest_close,
-                            'size': adjusted_quantity,
-                            'stop_loss': adjusted_stop_price,
-                            'trend': latest_trend,
-                            'open_time': str(datetime.now(timezone.utc)),
-                            'order_id': market_order['orderId'],
-                            'stop_loss_order_id': stop_loss_order_id
-                        }
-                        logger.info(
-                            f"{Fore.GREEN}Opened SHORT at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
-
-                previous_trend = latest_trend
-                display_trade_summary(current_position, latest_close, latest_line_st)
+            previous_trend = latest_trend
+            display_trade_summary(current_position, latest_close, latest_line_st)
 
     except Exception as e:
         logger.error(f"{Fore.RED}Error in WebSocket message: {str(e)}{Style.RESET_ALL}")

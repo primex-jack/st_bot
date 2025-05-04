@@ -22,13 +22,13 @@ from okx.PublicData import PublicAPI
 init()
 
 # Script Version
-SCRIPT_VERSION = "2.8.4"  # Updated to 2.8.4 for stop-loss with closeFraction
+SCRIPT_VERSION = "2.8.5"  # Updated to 2.8.5 for stop-loss handling update (Option 4) and position sync fixes
 
 # Set up logging with dual handlers
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 logging.getLogger('').handlers = []
-file_handler = logging.FileHandler('bot.log')
+file_handler = logging.FileHandler('okx_bot.log')
 file_handler.setLevel(logging.DEBUG)
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(file_formatter)
@@ -81,7 +81,7 @@ def load_config():
         }
 
 # Write PID to file and log startup
-with open('bot.pid', 'w') as f:
+with open('okx_bot.pid', 'w') as f:
     pid = os.getpid()
     f.write(str(pid))
 logger.info(f"{Fore.CYAN}Bot started with PID {pid} at {datetime.now(timezone.utc)}{Style.RESET_ALL}")
@@ -97,7 +97,7 @@ ATR_PERIOD = config['atr_period']
 ATR_RATIO = config['atr_ratio']
 POSITION_SIZE = config['position_size']
 TRADING_PAIR = config['trading_pair']
-OKX_TRADING_PAIR = TRADING_PAIR.replace("USDT", "-USDT-SWAP")  # OKX futures format (e.g., XRP-USDT-SWAP)
+OKX_TRADING_PAIR = TRADING_PAIR.replace("USDT", "-USDT-SWAP")  # OKX futures format (e.g., ETH-USDT-SWAP)
 TIMEFRAME = config['timeframe']
 STOP_LOSS_OFFSET = config['stop_loss_offset']
 
@@ -180,7 +180,7 @@ def load_symbol_config(symbol, public_api):
                 'pricePrecision': len(str(float(instrument['tickSz'])).split('.')[1]) if '.' in str(float(instrument['tickSz'])) else 0,
                 'minQty': float(instrument['minSz']),
                 'minNotional': float(instrument.get('minSz', 5.0)),  # OKX doesn't have minNotional, using minSz as proxy
-                'contractSize': float(instrument['ctVal'])  # Contract value (e.g., 0.01 BTC per contract for BTC-USDT-SWAP)
+                'contractSize': float(instrument['ctVal'])  # Contract value (e.g., 0.01 ETH per contract for ETH-USDT-SWAP)
             }
             with open(SYMBOL_CONFIG_FILE, 'w') as f:
                 json.dump(symbol_configs, f, indent=4)
@@ -192,9 +192,9 @@ def load_symbol_config(symbol, public_api):
 
 # Adjust quantity to match OKX precision and minimum size
 def adjust_quantity(quantity, symbol_config, price):
-    # Convert desired BTC amount to number of contracts
-    contract_size = symbol_config['contractSize']  # e.g., 0.01 BTC per contract for BTC-USDT-SWAP
-    contracts = quantity / contract_size  # Desired BTC / BTC per contract = number of contracts
+    # Convert desired ETH amount to number of contracts
+    contract_size = symbol_config['contractSize']  # e.g., 0.01 ETH per contract for ETH-USDT-SWAP
+    contracts = quantity / contract_size  # Desired ETH / ETH per contract = number of contracts
     lot_size = symbol_config.get('lotSize', 1.0)  # Fallback to 1.0 if lotSize is missing
     precision = symbol_config['quantityPrecision']
     min_qty = symbol_config['minQty']  # Minimum contracts (minSz)
@@ -213,7 +213,7 @@ def adjust_quantity(quantity, symbol_config, price):
     if adjusted % lot_size != 0:
         adjusted = round(adjusted / lot_size) * lot_size
         logger.debug(f"Adjusted quantity to be a multiple of lotSize: {adjusted}")
-    logger.debug(f"Adjusting quantity: desired_BTC={quantity}, contractSize={contract_size}, contracts={contracts}, precision={precision}, lotSize={lot_size}, minQty={min_qty}, minNotional={min_notional}, price={price}, adjusted_contracts={adjusted}, effective_BTC={adjusted * contract_size}")
+    logger.debug(f"Adjusting quantity: desired_ETH={quantity}, contractSize={contract_size}, contracts={contracts}, precision={precision}, lotSize={lot_size}, minQty={min_qty}, minNotional={min_notional}, price={price}, adjusted_contracts={adjusted}, effective_ETH={adjusted * contract_size}")
     return adjusted
 
 # Adjust price to match OKX precision
@@ -329,6 +329,7 @@ def cancel_all_stop_loss_orders(trade_api, symbol):
 # Update stop-loss order on OKX with retry logic
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 def update_stop_loss(trade_api, symbol, side, new_stop_price, current_stop_order_id, current_price, position_size, public_api):
+    global current_position
     try:
         symbol_config = load_symbol_config(symbol, public_api)
         new_stop_price = adjust_price(new_stop_price, symbol_config)
@@ -356,6 +357,10 @@ def update_stop_loss(trade_api, symbol, side, new_stop_price, current_stop_order
             }
             amend_result = trade_api.amend_algo_order(**amend_params)
             if amend_result['code'] != "0":
+                if "Position does not exist" in amend_result.get('msg', '') or amend_result.get('code') == "51169":
+                    logger.warning(f"No position exists to amend stop-loss for {symbol} (ErrCode: 51169). Clearing local state.")
+                    current_position = None
+                    return None
                 logger.error(f"Failed to amend stop-loss order: {amend_result}")
                 # If amendment fails, cancel the existing order and place a new one
                 logger.warning("Amendment failed. Canceling existing order and placing a new one.")
@@ -365,6 +370,10 @@ def update_stop_loss(trade_api, symbol, side, new_stop_price, current_stop_order
             else:
                 logger.info(f"Successfully modified stop-loss order ID: {current_stop_order_id} to new price: {new_stop_price}")
                 return current_stop_order_id
+
+        if current_position is None:
+            logger.warning(f"No position exists to set stop-loss for {symbol}. Skipping.")
+            return None
 
         # If no existing order or amendment failed, place a new stop-loss order
         params = {
@@ -387,6 +396,10 @@ def update_stop_loss(trade_api, symbol, side, new_stop_price, current_stop_order
 
         # Check response
         if stop_order['code'] != "0":
+            if "Position does not exist" in stop_order.get('msg', '') or stop_order.get('code') == "51169":
+                logger.warning(f"No position exists to set stop-loss for {symbol} (ErrCode: 51169). Clearing local state.")
+                current_position = None
+                return None
             logger.error(f"API response: {stop_order}")
             raise Exception(f"Failed to place stop-loss order: {stop_order.get('msg', '')}")
 
@@ -395,13 +408,17 @@ def update_stop_loss(trade_api, symbol, side, new_stop_price, current_stop_order
         return algo_id
 
     except Exception as e:
+        if "Position does not exist" in str(e) or "51169" in str(e):
+            logger.warning(f"No position exists to update stop-loss for {symbol} (ErrCode: 51169). Clearing local state.")
+            current_position = None
+            return None
         logger.error(f"Failed to update stop-loss: {str(e)}")
         raise
 
 # Initialize SQLite database
 def init_db():
     global current_position
-    conn = sqlite3.connect('trade_history.db')
+    conn = sqlite3.connect('okx_trade_history.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -607,6 +624,7 @@ def on_message(ws, message):
                 else:
                     logger.warning(
                         f"{Fore.YELLOW}Insufficient data: {len(kline_data)} candles, need at least {ATR_PERIOD}{Style.RESET_ALL}")
+                    return
 
                 df = kline_data.copy()
                 df.set_index('timestamp', inplace=True)
@@ -649,9 +667,30 @@ def on_message(ws, message):
                 adjusted_quantity = adjust_quantity(POSITION_SIZE, symbol_config, latest_close)
                 adjusted_stop_price = adjust_price(stop_loss, symbol_config)
 
+                # Sync position with OKX before making decisions
+                okx_position = sync_position_with_okx(okx_account_api, okx_trade_api, OKX_TRADING_PAIR)
+                logger.debug(f"Position sync result: {okx_position}")
+                if okx_position:
+                    if not current_position or current_position['side'] != okx_position['side'] or abs(
+                            current_position['size'] - okx_position['size']) > 0.0001:
+                        logger.warning(
+                            f"{Fore.YELLOW}Position mismatch detected. Updating from OKX: {okx_position}{Style.RESET_ALL}")
+                        current_position = okx_position
+                elif okx_position is None and current_position:
+                    logger.warning("No position on OKX. Clearing local state.")
+                    current_position = None
+                else:
+                    current_position = None
+
+                # Update current_position with the synced stop-loss and order ID
+                if okx_position and current_position:
+                    current_position['stop_loss'] = okx_position.get('stop_loss')
+                    current_position['stop_loss_order_id'] = okx_position.get('stop_loss_order_id')
+
                 # Check if the current position matches the trend; if not, flip the position
                 if current_position:
                     position_trend = 1 if current_position['side'] == 'LONG' else -1
+                    logger.debug(f"Current position: side={current_position['side']}, position_trend={position_trend}, latest_trend={latest_trend}")
                     if position_trend != latest_trend:
                         logger.info(f"Position trend mismatch detected: Position {current_position['side']} (trend {position_trend}), Indicator trend {latest_trend}. Flipping position.")
                         if current_position['side'] == 'LONG' and latest_trend == -1:
@@ -723,11 +762,11 @@ def on_message(ws, message):
                                 logger.error(f"Market order response: {market_order}")
                                 raise Exception(f"Failed to place market order: {market_order['msg']}")
                             stop_loss_order_id = update_stop_loss(okx_trade_api, OKX_TRADING_PAIR, 'SHORT', adjusted_stop_price, None, latest_close, POSITION_SIZE, okx_public_api)
-                            btc_size = adjusted_quantity * symbol_config['contractSize']
+                            eth_size = adjusted_quantity * symbol_config['contractSize']
                             current_position = {
                                 'side': 'SHORT',
                                 'entry_price': latest_close,
-                                'size': btc_size,
+                                'size': eth_size,
                                 'stop_loss': adjusted_stop_price,
                                 'trend': latest_trend,
                                 'open_time': str(datetime.now(timezone.utc)),
@@ -806,11 +845,11 @@ def on_message(ws, message):
                                 logger.error(f"Market order response: {market_order}")
                                 raise Exception(f"Failed to place market order: {market_order['msg']}")
                             stop_loss_order_id = update_stop_loss(okx_trade_api, OKX_TRADING_PAIR, 'LONG', adjusted_stop_price, None, latest_close, POSITION_SIZE, okx_public_api)
-                            btc_size = adjusted_quantity * symbol_config['contractSize']
+                            eth_size = adjusted_quantity * symbol_config['contractSize']
                             current_position = {
                                 'side': 'LONG',
                                 'entry_price': latest_close,
-                                'size': btc_size,
+                                'size': eth_size,
                                 'stop_loss': adjusted_stop_price,
                                 'trend': latest_trend,
                                 'open_time': str(datetime.now(timezone.utc)),
@@ -859,6 +898,7 @@ def on_message(ws, message):
 
                     # Check if stop-loss is triggered
                     if current_position and current_position.get('stop_loss') is not None:
+                        logger.debug(f"Checking stop-loss trigger: side={current_position['side']}, latest_close={latest_close}, stop_loss={current_position['stop_loss']}")
                         if (current_position['side'] == 'LONG' and latest_close <= current_position['stop_loss']) or \
                            (current_position['side'] == 'SHORT' and latest_close >= current_position['stop_loss']):
                             cancel_all_stop_loss_orders(okx_trade_api, OKX_TRADING_PAIR)
@@ -887,22 +927,23 @@ def on_message(ws, message):
                                 logger.debug(f"Market close order response: {close_order}")
                                 if close_order['code'] != "0":
                                     if 'Position does not exist' in close_order.get('msg', '') or ('sCode' in close_order.get('data', [{}])[0] and close_order['data'][0]['sCode'] == '51169'):
-                                        logger.warning("Position already closed on OKX. Updating state.")
+                                        logger.warning("Position already closed on OKX (stop-loss likely triggered). Updating state.")
                                     else:
                                         logger.error(f"Failed to close position with market order. Response: {close_order}")
                                         raise Exception(f"Failed to close position with market order: {close_order['msg']} (Response: {close_order})")
                             # Extract order ID if available
                             ord_id = close_order['data'][0].get('ordId', 'unknown') if close_order['code'] == "0" and 'data' in close_order and close_order['data'] else 'unknown'
+                            previous_side = current_position['side']  # Store the side before closing
                             trade = {
                                 'timestamp': str(datetime.now(timezone.utc)),
                                 'trading_pair': TRADING_PAIR,
                                 'timeframe': TIMEFRAME,
-                                'side': current_position['side'],
+                                'side': previous_side,
                                 'entry_price': current_position['entry_price'],
                                 'size': current_position['size'],
                                 'exit_price': latest_close,
                                 'stop_loss': current_position.get('stop_loss'),
-                                'profit_loss': (latest_close - current_position['entry_price']) * current_position['size'] if current_position['side'] == 'LONG' else (current_position['entry_price'] - latest_close) * current_position['size'],
+                                'profit_loss': (latest_close - current_position['entry_price']) * current_position['size'] if previous_side == 'LONG' else (current_position['entry_price'] - latest_close) * current_position['size'],
                                 'trend': latest_trend,
                                 'order_id': ord_id,
                                 'stop_loss_order_id': current_position.get('stop_loss_order_id')
@@ -910,20 +951,21 @@ def on_message(ws, message):
                             trade_history.append(trade)
                             log_trade(conn, trade)
                             logger.info(
-                                f"{Fore.RED}Stop-loss triggered: Closed {current_position['side']} at {latest_close:.2f}, P/L: {trade['profit_loss']:.2f} USDT{Style.RESET_ALL}")
+                                f"{Fore.RED}Stop-loss triggered: Closed {previous_side} at {latest_close:.2f}, P/L: {trade['profit_loss']:.2f} USDT{Style.RESET_ALL}")
                             # Sync position after closing
                             okx_position = sync_position_with_okx(okx_account_api, okx_trade_api, OKX_TRADING_PAIR)
                             if not okx_position:
-                                logger.info("Position successfully closed.")
+                                logger.info("Position successfully closed. Awaiting manual intervention to resume trading.")
                                 current_position = None
                             else:
                                 logger.warning(f"Position still exists after stop-loss trigger: {okx_position}")
                                 current_position = okx_position
                                 display_trade_summary(current_position, latest_close, latest_line_st)
-                                return  # Skip further actions until position is resolved
+                                return
 
                 # If there's no position and it's the first candle with --force-first-trade, open a new position
                 if not current_position and ((force_first_trade and closed_candle_count == 1) or (previous_trend is not None and previous_trend != latest_trend)):
+                    logger.debug(f"Opening new position: force_first_trade={force_first_trade}, closed_candle_count={closed_candle_count}, previous_trend={previous_trend}, latest_trend={latest_trend}")
                     if latest_trend == 1:
                         market_order = okx_trade_api.place_order(
                             instId=OKX_TRADING_PAIR,
@@ -938,11 +980,11 @@ def on_message(ws, message):
                             raise Exception(f"Failed to place market order: {market_order['msg']}")
                         stop_loss_order_id = update_stop_loss(okx_trade_api, OKX_TRADING_PAIR, 'LONG', adjusted_stop_price, None,
                                                               latest_close, POSITION_SIZE, okx_public_api)
-                        btc_size = adjusted_quantity * symbol_config['contractSize']
+                        eth_size = adjusted_quantity * symbol_config['contractSize']
                         current_position = {
                             'side': 'LONG',
                             'entry_price': latest_close,
-                            'size': btc_size,
+                            'size': eth_size,
                             'stop_loss': adjusted_stop_price,
                             'trend': latest_trend,
                             'open_time': str(datetime.now(timezone.utc)),
@@ -965,11 +1007,11 @@ def on_message(ws, message):
                             raise Exception(f"Failed to place market order: {market_order['msg']}")
                         stop_loss_order_id = update_stop_loss(okx_trade_api, OKX_TRADING_PAIR, 'SHORT', adjusted_stop_price, None,
                                                               latest_close, POSITION_SIZE, okx_public_api)
-                        btc_size = adjusted_quantity * symbol_config['contractSize']
+                        eth_size = adjusted_quantity * symbol_config['contractSize']
                         current_position = {
                             'side': 'SHORT',
                             'entry_price': latest_close,
-                            'size': btc_size,
+                            'size': eth_size,
                             'stop_loss': adjusted_stop_price,
                             'trend': latest_trend,
                             'open_time': str(datetime.now(timezone.utc)),
@@ -978,20 +1020,6 @@ def on_message(ws, message):
                         }
                         logger.info(
                             f"{Fore.GREEN}Opened SHORT at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
-
-                # Sync position with OKX after every candle
-                okx_position = sync_position_with_okx(okx_account_api, okx_trade_api, OKX_TRADING_PAIR)
-                if okx_position:
-                    if not current_position or current_position['side'] != okx_position['side'] or abs(
-                            current_position['size'] - okx_position['size']) > 0.0001:
-                        logger.warning(
-                            f"{Fore.YELLOW}Position mismatch detected. Updating from OKX: {okx_position}{Style.RESET_ALL}")
-                        current_position = okx_position
-                elif okx_position is None and current_position:
-                    logger.warning("No position on OKX. Clearing local state.")
-                    current_position = None
-                else:
-                    current_position = None
 
                 logger.debug(f"Current Position: {current_position}, Latest Trend: {latest_trend}, Previous Trend: {previous_trend}")
 
