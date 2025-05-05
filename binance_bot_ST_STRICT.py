@@ -19,7 +19,7 @@ import hashlib
 init()
 
 # Script Version
-SCRIPT_VERSION = "2.8.3"  # Updated to 2.8.3 for stop-loss handling and position sync fixes
+SCRIPT_VERSION = "2.8.4"  # Updated to 2.8.4 for immediate stop-loss setting after position open
 
 # Set up logging with dual handlers
 logger = logging.getLogger(__name__)
@@ -241,8 +241,7 @@ def cancel_all_stop_loss_orders(client, symbol):
 
 # Update stop-loss order on Binance with retry logic
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
-def update_stop_loss(client, symbol, side, new_stop_price, current_stop_order_id, current_price):
-    global current_position
+def update_stop_loss(client, symbol, side, new_stop_price, current_stop_order_id, current_price, is_new_position=False):
     try:
         symbol_config = load_symbol_config(symbol, client)
         new_stop_price = adjust_price(new_stop_price, symbol_config)
@@ -264,9 +263,13 @@ def update_stop_loss(client, symbol, side, new_stop_price, current_stop_order_id
                     if not cancel_all_stop_loss_orders(client, symbol):
                         raise Exception("Failed to cancel existing stop-loss orders")
 
-        if current_position is None:
-            logger.warning(f"No position exists to set stop-loss for {symbol}. Skipping.")
-            return None
+        # If this is a new position, we assume the position exists since it was just opened
+        if not is_new_position:
+            # For existing positions, verify the position still exists
+            position = sync_position_with_binance(client, symbol)
+            if not position:
+                logger.warning(f"No position exists to set stop-loss for {symbol}.")
+                return None
 
         stop_order = client.new_order(
             symbol=symbol,
@@ -282,8 +285,7 @@ def update_stop_loss(client, symbol, side, new_stop_price, current_stop_order_id
         return stop_order['orderId']
     except Exception as e:
         if "Position does not exist" in str(e):
-            logger.warning(f"No position exists to set stop-loss for {symbol}. Clearing local state.")
-            current_position = None
+            logger.warning(f"No position exists to set stop-loss for {symbol}.")
             return None
         logger.error(f"Failed to update stop-loss: {str(e)}")
         raise
@@ -620,11 +622,24 @@ def on_message(ws, message):
                                 type='MARKET',
                                 quantity=adjusted_quantity
                             )
-                            stop_loss_order_id = update_stop_loss(client, TRADING_PAIR, 'SHORT', adjusted_stop_price, None,
-                                                                  latest_close)
+                            # Sync position immediately to confirm it was opened
+                            binance_position = sync_position_with_binance(client, TRADING_PAIR)
+                            if not binance_position:
+                                logger.error("Failed to confirm new SHORT position after placing order.")
+                                raise Exception("Failed to confirm new SHORT position after placing order.")
+                            # Set stop-loss immediately after confirming the position
+                            stop_loss_order_id = update_stop_loss(
+                                client,
+                                TRADING_PAIR,
+                                'SHORT',
+                                adjusted_stop_price,
+                                None,
+                                latest_close,
+                                is_new_position=True
+                            )
                             current_position = {
                                 'side': 'SHORT',
-                                'entry_price': latest_close,
+                                'entry_price': binance_position['entry_price'],
                                 'size': adjusted_quantity,
                                 'stop_loss': adjusted_stop_price,
                                 'trend': latest_trend,
@@ -687,11 +702,24 @@ def on_message(ws, message):
                                 type='MARKET',
                                 quantity=adjusted_quantity
                             )
-                            stop_loss_order_id = update_stop_loss(client, TRADING_PAIR, 'LONG', adjusted_stop_price, None,
-                                                                  latest_close)
+                            # Sync position immediately to confirm it was opened
+                            binance_position = sync_position_with_binance(client, TRADING_PAIR)
+                            if not binance_position:
+                                logger.error("Failed to confirm new LONG position after placing order.")
+                                raise Exception("Failed to confirm new LONG position after placing order.")
+                            # Set stop-loss immediately after confirming the position
+                            stop_loss_order_id = update_stop_loss(
+                                client,
+                                TRADING_PAIR,
+                                'LONG',
+                                adjusted_stop_price,
+                                None,
+                                latest_close,
+                                is_new_position=True
+                            )
                             current_position = {
                                 'side': 'LONG',
-                                'entry_price': latest_close,
+                                'entry_price': binance_position['entry_price'],
                                 'size': adjusted_quantity,
                                 'stop_loss': adjusted_stop_price,
                                 'trend': latest_trend,
@@ -798,11 +826,24 @@ def on_message(ws, message):
                         type='MARKET',
                         quantity=adjusted_quantity
                     )
-                    stop_loss_order_id = update_stop_loss(client, TRADING_PAIR, 'LONG', adjusted_stop_price, None,
-                                                          latest_close)
+                    # Sync position immediately to confirm it was opened
+                    binance_position = sync_position_with_binance(client, TRADING_PAIR)
+                    if not binance_position:
+                        logger.error("Failed to confirm new LONG position after placing order.")
+                        raise Exception("Failed to confirm new LONG position after placing order.")
+                    # Set stop-loss immediately after confirming the position
+                    stop_loss_order_id = update_stop_loss(
+                        client,
+                        TRADING_PAIR,
+                        'LONG',
+                        adjusted_stop_price,
+                        None,
+                        latest_close,
+                        is_new_position=True
+                    )
                     current_position = {
                         'side': 'LONG',
-                        'entry_price': latest_close,
+                        'entry_price': binance_position['entry_price'],
                         'size': adjusted_quantity,
                         'stop_loss': adjusted_stop_price,
                         'trend': latest_trend,
@@ -820,11 +861,24 @@ def on_message(ws, message):
                         type='MARKET',
                         quantity=adjusted_quantity
                     )
-                    stop_loss_order_id = update_stop_loss(client, TRADING_PAIR, 'SHORT', adjusted_stop_price, None,
-                                                          latest_close)
+                    # Sync position immediately to confirm it was opened
+                    binance_position = sync_position_with_binance(client, TRADING_PAIR)
+                    if not binance_position:
+                        logger.error("Failed to confirm new SHORT position after placing order.")
+                        raise Exception("Failed to confirm new SHORT position after placing order.")
+                    # Set stop-loss immediately after confirming the position
+                    stop_loss_order_id = update_stop_loss(
+                        client,
+                        TRADING_PAIR,
+                        'SHORT',
+                        adjusted_stop_price,
+                        None,
+                        latest_close,
+                        is_new_position=True
+                    )
                     current_position = {
                         'side': 'SHORT',
-                        'entry_price': latest_close,
+                        'entry_price': binance_position['entry_price'],
                         'size': adjusted_quantity,
                         'stop_loss': adjusted_stop_price,
                         'trend': latest_trend,
