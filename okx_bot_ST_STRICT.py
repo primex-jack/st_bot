@@ -22,7 +22,7 @@ from okx.PublicData import PublicAPI
 init()
 
 # Script Version
-SCRIPT_VERSION = "2.8.5"  # Updated to 2.8.5 for stop-loss handling update (Option 4) and position sync fixes
+SCRIPT_VERSION = "2.8.6"  # Add write_position_to_db Calls in on_message / To fix the wrong or missing database entries
 
 # Set up logging with dual handlers
 logger = logging.getLogger(__name__)
@@ -148,6 +148,46 @@ trade_history = []
 
 # File paths
 SYMBOL_CONFIG_FILE = 'symbol_configs.json'
+
+# Helper function to write current_position to the database
+def write_position_to_db(conn, position):
+    if not position:
+        logger.debug("No position to write to database")
+        return
+    c = conn.cursor()
+    # Check if a trade with this order_id already exists and is active
+    c.execute("SELECT * FROM trades WHERE order_id = ? AND exit_price IS NULL", (position.get('order_id'),))
+    existing_trade = c.fetchone()
+    if existing_trade:
+        logger.debug(f"Active trade with order_id={position['order_id']} already exists in database. Updating.")
+        c.execute("""
+            UPDATE trades
+            SET timestamp = ?, side = ?, entry_price = ?, size = ?, stop_loss = ?, stop_loss_order_id = ?
+            WHERE id = ?
+        """, (
+            position['open_time'],
+            position['side'],
+            position['entry_price'],
+            position['size'],
+            position.get('stop_loss'),
+            position.get('stop_loss_order_id'),
+            existing_trade[0]  # id
+        ))
+    else:
+        # Check for stale active trades and close them
+        c.execute("UPDATE trades SET exit_price = 0 WHERE trading_pair = ? AND exit_price IS NULL", (TRADING_PAIR,))
+        if c.rowcount > 0:
+            logger.info(f"Closed {c.rowcount} stale active trades before inserting new position")
+        # Insert the new position
+        c.execute(
+            "INSERT INTO trades (timestamp, trading_pair, timeframe, side, entry_price, size, stop_loss, stop_loss_order_id, order_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (position['open_time'], TRADING_PAIR, TIMEFRAME, position['side'],
+             position['entry_price'], position['size'], position.get('stop_loss'),
+             position.get('stop_loss_order_id'), position.get('order_id'))
+        )
+    conn.commit()
+    logger.debug(f"Wrote position to database: {position}")
 
 # Load or fetch symbol configuration (for OKX)
 def load_symbol_config(symbol, public_api):
@@ -791,6 +831,8 @@ def on_message(ws, message):
                             }
                             logger.info(
                                 f"{Fore.GREEN}Reversed to SHORT at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+                            # Write the new position to the database immediately
+                            write_position_to_db(conn, current_position)
 
                         elif current_position['side'] == 'SHORT' and latest_trend == 1:
                             cancel_all_stop_loss_orders(okx_trade_api, OKX_TRADING_PAIR)
@@ -890,6 +932,8 @@ def on_message(ws, message):
                             }
                             logger.info(
                                 f"{Fore.GREEN}Reversed to LONG at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+                            # Write the new position to the database immediately
+                            write_position_to_db(conn, current_position)
 
                     # If the position matches the trend, manage the stop-loss
                     elif current_position['side'] == ('LONG' if latest_trend == 1 else 'SHORT'):
@@ -925,6 +969,19 @@ def on_message(ws, message):
                                 current_position['stop_loss'] = adjusted_stop_price
                                 current_position['stop_loss_order_id'] = new_stop_loss_order_id
                                 logger.info(f"{Fore.YELLOW}Updated stop-loss to {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+                                # Update only the stop-loss in the database without closing the trade
+                                c = conn.cursor()
+                                c.execute("""
+                                    UPDATE trades
+                                    SET stop_loss = ?, stop_loss_order_id = ?
+                                    WHERE order_id = ? AND exit_price IS NULL
+                                """, (
+                                    current_position['stop_loss'],
+                                    current_position['stop_loss_order_id'],
+                                    current_position['order_id']
+                                ))
+                                conn.commit()
+                                logger.debug(f"Updated stop-loss in database for order_id={current_position['order_id']}")
                         else:
                             logger.debug(f"Stop-loss unchanged: {current_sl:.2f} (within epsilon of {adjusted_stop_price:.2f})")
 
@@ -1040,6 +1097,8 @@ def on_message(ws, message):
                         }
                         logger.info(
                             f"{Fore.GREEN}Opened LONG at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+                        # Write the new position to the database immediately
+                        write_position_to_db(conn, current_position)
                     elif latest_trend == -1:
                         market_order = okx_trade_api.place_order(
                             instId=OKX_TRADING_PAIR,
@@ -1082,6 +1141,8 @@ def on_message(ws, message):
                         }
                         logger.info(
                             f"{Fore.GREEN}Opened SHORT at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+                        # Write the new position to the database immediately
+                        write_position_to_db(conn, current_position)
 
                 logger.debug(f"Current Position: {current_position}, Latest Trend: {latest_trend}, Previous Trend: {previous_trend}")
 

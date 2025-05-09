@@ -138,6 +138,45 @@ trade_history = []
 # File paths
 SYMBOL_CONFIG_FILE = 'bybit_symbol_configs.json'
 
+# Helper function to write current_position to the database
+def write_position_to_db(conn, position):
+    if not position:
+        logger.debug("No position to write to database")
+        return
+    c = conn.cursor()
+    # Check if a trade with this order_id already exists and is active
+    c.execute("SELECT * FROM trades WHERE order_id = ? AND exit_price IS NULL", (position.get('order_id'),))
+    existing_trade = c.fetchone()
+    if existing_trade:
+        logger.debug(f"Active trade with order_id={position['order_id']} already exists in database. Updating.")
+        c.execute("""
+            UPDATE trades
+            SET timestamp = ?, side = ?, entry_price = ?, size = ?, stop_loss = ?, stop_loss_order_id = ?
+            WHERE id = ?
+        """, (
+            position['open_time'],
+            position['side'],
+            position['entry_price'],
+            position['size'],
+            position.get('stop_loss'),
+            position.get('stop_loss_order_id'),
+            existing_trade[0]  # id
+        ))
+    else:
+        # Check for stale active trades and close them
+        c.execute("UPDATE trades SET exit_price = 0 WHERE trading_pair = ? AND exit_price IS NULL", (TRADING_PAIR,))
+        if c.rowcount > 0:
+            logger.info(f"Closed {c.rowcount} stale active trades before inserting new position")
+        # Insert the new position
+        c.execute(
+            "INSERT INTO trades (timestamp, trading_pair, timeframe, side, entry_price, size, stop_loss, stop_loss_order_id, order_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (position['open_time'], TRADING_PAIR, TIMEFRAME, position['side'],
+             position['entry_price'], position['size'], position.get('stop_loss'),
+             position.get('stop_loss_order_id'), position.get('order_id'))
+        )
+    conn.commit()
+    logger.debug(f"Wrote position to database: {position}")
 
 # Load or fetch symbol configuration (for Bybit)
 def load_symbol_config(symbol):
@@ -422,8 +461,8 @@ def init_db():
                         stop_loss REAL,
                         profit_loss REAL,
                         trend INTEGER,
-                        order_id TEXT,  -- Changed to TEXT to match schema
-                        stop_loss_order_id TEXT  -- Changed to TEXT to match schema
+                        order_id TEXT,
+                        stop_loss_order_id TEXT
                      )''')
         conn.commit()
         logger.debug("Initialized SQLite database: trade_history.db")
@@ -434,29 +473,48 @@ def init_db():
             current_position = bybit_position
             logger.info(
                 f"Synced position from Bybit: Side: {current_position['side']}, Entry Price: {current_position['entry_price']:.2f}, Stop Loss: {current_position.get('stop_loss', 'None')}")
-            c.execute("UPDATE trades SET exit_price = 0 WHERE trading_pair = ? AND exit_price IS NULL", (TRADING_PAIR,))
-            if c.rowcount > 0:
-                logger.info(f"Closed {c.rowcount} stale active trades in database for {TRADING_PAIR}")
-            conn.commit()
 
-            try:
+            # Check if a trade with the same order_id exists
+            order_id = current_position.get('order_id')
+            c.execute("SELECT * FROM trades WHERE trading_pair = ? AND order_id = ? AND exit_price IS NULL",
+                      (TRADING_PAIR, order_id))
+            existing_trade = c.fetchone()
+
+            if existing_trade:
+                # Update the existing trade
+                logger.info(f"Found existing active trade with order_id={order_id}. Updating details.")
+                c.execute("""
+                    UPDATE trades
+                    SET timestamp = ?, side = ?, entry_price = ?, size = ?, stop_loss = ?, stop_loss_order_id = ?
+                    WHERE id = ?
+                """, (
+                    current_position['open_time'],
+                    current_position['side'],
+                    current_position['entry_price'],
+                    current_position['size'],
+                    current_position.get('stop_loss'),
+                    current_position.get('stop_loss_order_id'),
+                    existing_trade[0]  # id
+                ))
+            else:
+                # Insert a new trade, close stale trades first
+                c.execute("UPDATE trades SET exit_price = 0 WHERE trading_pair = ? AND exit_price IS NULL", (TRADING_PAIR,))
+                if c.rowcount > 0:
+                    logger.info(f"Closed {c.rowcount} stale active trades in database for {TRADING_PAIR}")
                 c.execute(
-                    "INSERT INTO trades (timestamp, trading_pair, timeframe, side, entry_price, size, stop_loss, stop_loss_order_id, order_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO trades (timestamp, trading_pair, timeframe, side, entry_price, size, stop_loss, stop_loss_order_id, order_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (current_position['open_time'], TRADING_PAIR, TIMEFRAME, current_position['side'],
                      current_position['entry_price'], current_position['size'], current_position.get('stop_loss'),
                      current_position.get('stop_loss_order_id'), current_position.get('order_id'))
                 )
-                conn.commit()
-                logger.info(
-                    f"Inserted new active trade into database: Side: {current_position['side']}, Entry Price: {current_position['entry_price']:.2f}")
-            except sqlite3.Error as e:
-                logger.error(f"Failed to insert trade into database during init: {e}")
-                raise
+            conn.commit()
+            logger.info(
+                f"Inserted/Updated active trade in database: Side: {current_position['side']}, Entry Price: {current_position['entry_price']:.2f}")
         else:
             c.execute("UPDATE trades SET exit_price = 0 WHERE trading_pair = ? AND exit_price IS NULL", (TRADING_PAIR,))
             if c.rowcount > 0:
-                logger.info(
-                    f"Closed {c.rowcount} stale active trades in database for {TRADING_PAIR} (no position on Bybit)")
+                logger.info(f"Closed {c.rowcount} stale active trades in database for {TRADING_PAIR} (no position on Bybit)")
             conn.commit()
             current_position = None
             logger.info("No active position found on Bybit or in database")
@@ -822,19 +880,8 @@ def on_message(ws, message):
                             }
                             logger.info(
                                 f"{Fore.GREEN}Reversed to SHORT at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
-                            trade = {
-                                'timestamp': current_position['open_time'],
-                                'trading_pair': TRADING_PAIR,
-                                'timeframe': TIMEFRAME,
-                                'side': current_position['side'],
-                                'entry_price': current_position['entry_price'],
-                                'size': current_position['size'],
-                                'stop_loss': current_position['stop_loss'],
-                                'trend': current_position['trend'],
-                                'order_id': current_position['order_id'],
-                                'stop_loss_order_id': current_position['stop_loss_order_id']
-                            }
-                            log_trade(conn, trade)
+                            # Write the new position to the database immediately
+                            write_position_to_db(conn, current_position)
 
                     elif current_position['side'] == 'SHORT' and latest_trend == 1:
                         cancel_all_stop_loss_orders(bybit_client, BYBIT_TRADING_PAIR)
@@ -933,19 +980,8 @@ def on_message(ws, message):
                             }
                             logger.info(
                                 f"{Fore.GREEN}Reversed to LONG at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
-                            trade = {
-                                'timestamp': current_position['open_time'],
-                                'trading_pair': TRADING_PAIR,
-                                'timeframe': TIMEFRAME,
-                                'side': current_position['side'],
-                                'entry_price': current_position['entry_price'],
-                                'size': current_position['size'],
-                                'stop_loss': current_position['stop_loss'],
-                                'trend': current_position['trend'],
-                                'order_id': current_position['order_id'],
-                                'stop_loss_order_id': current_position['stop_loss_order_id']
-                            }
-                            log_trade(conn, trade)
+                            # Write the new position to the database immediately
+                            write_position_to_db(conn, current_position)
 
                 elif current_position['side'] == ('LONG' if latest_trend == 1 else 'SHORT'):
                     logger.debug(f"Current SL: {current_position.get('stop_loss')}, Adjusted SL: {adjusted_stop_price}")
@@ -978,6 +1014,19 @@ def on_message(ws, message):
                             current_position['stop_loss'] = adjusted_stop_price
                             current_position['stop_loss_order_id'] = new_stop_loss_order_id
                             logger.info(f"{Fore.YELLOW}Updated stop-loss to {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+                            # Update only the stop-loss in the database without closing the trade
+                            c = conn.cursor()
+                            c.execute("""
+                                UPDATE trades
+                                SET stop_loss = ?, stop_loss_order_id = ?
+                                WHERE order_id = ? AND exit_price IS NULL
+                            """, (
+                                current_position['stop_loss'],
+                                current_position['stop_loss_order_id'],
+                                current_position['order_id']
+                            ))
+                            conn.commit()
+                            logger.debug(f"Updated stop-loss in database for order_id={current_position['order_id']}")
                     else:
                         logger.debug(
                             f"Stop-loss unchanged: {current_sl:.2f} (within epsilon of {adjusted_stop_price:.2f})")
@@ -1051,126 +1100,7 @@ def on_message(ws, message):
                     previous_trend is not None and previous_trend != latest_trend)):
                 logger.debug(
                     f"Opening new position: force_first_trade={force_first_trade}, closed_candle_count={closed_candle_count}, previous_trend={previous_trend}, latest_trend={latest_trend}")
-                if latest_trend == 1:
-                    logger.debug("Opening LONG position")
-                    market_order = bybit_client.place_order(
-                        category="linear",
-                        symbol=BYBIT_TRADING_PAIR,
-                        side="Buy",
-                        orderType="Market",
-                        qty=str(adjusted_quantity)
-                    )
-                    logger.debug(f"Market order response: {market_order}")
-                    if market_order['retCode'] != 0:
-                        raise Exception(f"Failed to place market order: {market_order['retMsg']}")
-
-                    # Sync position immediately to confirm it was opened
-                    bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
-                    if not bybit_position:
-                        logger.error("Failed to confirm new LONG position after placing order.")
-                        raise Exception("Failed to confirm new LONG position after placing order.")
-
-                    # Set stop-loss immediately after confirming the position
-                    stop_loss_order_id = update_stop_loss(
-                        bybit_client,
-                        BYBIT_TRADING_PAIR,
-                        'LONG',
-                        adjusted_stop_price,
-                        None,
-                        latest_close,
-                        POSITION_SIZE,
-                        is_new_position=True
-                    )
-                    current_position = {
-                        'side': 'LONG',
-                        'entry_price': bybit_position['entry_price'],
-                        'size': adjusted_quantity,
-                        'stop_loss': adjusted_stop_price,
-                        'trend': latest_trend,
-                        'open_time': str(datetime.now(timezone.utc)),
-                        'order_id': market_order['result']['orderId'],
-                        'stop_loss_order_id': stop_loss_order_id
-                    }
-                    logger.info(
-                        f"{Fore.GREEN}Opened LONG at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
-                    trade = {
-                        'timestamp': current_position['open_time'],
-                        'trading_pair': TRADING_PAIR,
-                        'timeframe': TIMEFRAME,
-                        'side': current_position['side'],
-                        'entry_price': current_position['entry_price'],
-                        'size': current_position['size'],
-                        'stop_loss': current_position['stop_loss'],
-                        'trend': current_position['trend'],
-                        'order_id': current_position['order_id'],
-                        'stop_loss_order_id': current_position['stop_loss_order_id']
-                    }
-                    log_trade(conn, trade)
-
-                elif latest_trend == -1:
-                    logger.debug("Opening SHORT position")
-                    market_order = bybit_client.place_order(
-                        category="linear",
-                        symbol=BYBIT_TRADING_PAIR,
-                        side="Sell",
-                        orderType="Market",
-                        qty=str(adjusted_quantity)
-                    )
-                    logger.debug(f"Market order response: {market_order}")
-                    if market_order['retCode'] != 0:
-                        raise Exception(f"Failed to place market order: {market_order['retMsg']}")
-
-                    # Sync position immediately to confirm it was opened
-                    bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
-                    if not bybit_position:
-                        logger.error("Failed to confirm new SHORT position after placing order.")
-                        raise Exception("Failed to confirm new SHORT position after placing order.")
-
-                    # Set stop-loss immediately after confirming the position
-                    stop_loss_order_id = update_stop_loss(
-                        bybit_client,
-                        BYBIT_TRADING_PAIR,
-                        'SHORT',
-                        adjusted_stop_price,
-                        None,
-                        latest_close,
-                        POSITION_SIZE,
-                        is_new_position=True
-                    )
-                    current_position = {
-                        'side': 'SHORT',
-                        'entry_price': bybit_position['entry_price'],
-                        'size': adjusted_quantity,
-                        'stop_loss': adjusted_stop_price,
-                        'trend': latest_trend,
-                        'open_time': str(datetime.now(timezone.utc)),
-                        'order_id': market_order['result']['orderId'],
-                        'stop_loss_order_id': stop_loss_order_id
-                    }
-                    logger.info(
-                        f"{Fore.GREEN}Opened SHORT at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
-                    trade = {
-                        'timestamp': current_position['open_time'],
-                        'trading_pair': TRADING_PAIR,
-                        'timeframe': TIMEFRAME,
-                        'side': current_position['side'],
-                        'entry_price': current_position['entry_price'],
-                        'size': current_position['size'],
-                        'stop_loss': current_position['stop_loss'],
-                        'trend': current_position['trend'],
-                        'order_id': current_position['order_id'],
-                        'stop_loss_order_id': current_position['stop_loss_order_id']
-                    }
-                    log_trade(conn, trade)
-
-            logger.debug(
-                f"Current Position: {current_position}, Latest Trend: {latest_trend}, Previous Trend: {previous_trend}")
-
-            previous_trend = latest_trend
-            display_trade_summary(current_position, latest_close, latest_line_st)
-
-    except Exception as e:
-        logger.error(f"{Fore.RED}Error in WebSocket message: {str(e)}{Style.RESET_ALL}")
+                if latest_trend ==
 
 
 def on_error(ws, error):

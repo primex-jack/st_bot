@@ -33,7 +33,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Script Version
-SCRIPT_VERSION = "2.7.9"  # Updated for OKX bot compatibility
+SCRIPT_VERSION = "2.8.1"  # Update the Watchdog Threshold in main
 
 # File paths
 BOT_SCRIPT = 'okx_bot_ST_STRICT.py'  # Updated to OKX bot script
@@ -91,6 +91,9 @@ def parse_timeframe(timeframe):
     if timeframe.endswith('m'):
         minutes = int(timeframe[:-1])
         return minutes * 60
+    elif timeframe.endswith('h'):
+        hours = int(timeframe[:-1])
+        return hours * 60 * 60  # Convert hours to seconds
     else:
         logger.warning(f"Unsupported timeframe: {timeframe}. Assuming 60 seconds.")
         return 60
@@ -209,6 +212,8 @@ def main(force_first_trade):
 
     candle_interval = parse_timeframe(TIMEFRAME)
     buffer = 180  # 3 minutes buffer
+    # Use 2 * candle_interval + buffer as the threshold to account for long timeframes
+    candle_threshold = 2 * candle_interval + buffer
     startup_grace_period = 120  # Increased to 120 seconds to account for WebSocket connection and historical data fetching
 
     while True:
@@ -240,8 +245,8 @@ def main(force_first_trade):
                         last_candle_timestamp = get_last_log_timestamp(BOT_LOG, 'Bar Closed')
                         if last_candle_timestamp:
                             time_since_last_candle = (datetime.now() - last_candle_timestamp).total_seconds()
-                            if time_since_last_candle > candle_interval + buffer:
-                                logger.warning(f"Bot not processing candles for {time_since_last_candle:.0f} seconds (>{candle_interval + buffer} seconds). Restarting...")
+                            if time_since_last_candle > candle_threshold:
+                                logger.warning(f"Bot not processing candles for {time_since_last_candle:.0f} seconds (>{candle_threshold} seconds). Restarting...")
                                 send_telegram_message(f"Bot not processing candles for {time_since_last_candle:.0f} seconds. Restarting...")
                                 start_bot(pid, force_first_trade)
                         else:

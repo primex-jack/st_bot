@@ -832,8 +832,19 @@ def on_message(ws, message):
                             current_position['stop_loss'] = adjusted_stop_price
                             current_position['stop_loss_order_id'] = new_stop_loss_order_id
                             logger.info(f"{Fore.YELLOW}Updated stop-loss to {adjusted_stop_price:.2f}{Style.RESET_ALL}")
-                            # Update the stop-loss in the database
-                            write_position_to_db(conn, current_position)
+                            # Update only the stop-loss in the database without closing the trade
+                            c = conn.cursor()
+                            c.execute("""
+                                UPDATE trades
+                                SET stop_loss = ?, stop_loss_order_id = ?
+                                WHERE order_id = ? AND exit_price IS NULL
+                            """, (
+                                current_position['stop_loss'],
+                                current_position['stop_loss_order_id'],
+                                current_position['order_id']
+                            ))
+                            conn.commit()
+                            logger.debug(f"Updated stop-loss in database for order_id={current_position['order_id']}")
                     else:
                         logger.debug(f"Stop-loss unchanged: {current_sl:.2f} (within epsilon of {adjusted_stop_price:.2f})")
 
