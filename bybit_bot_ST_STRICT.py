@@ -1100,7 +1100,104 @@ def on_message(ws, message):
                     previous_trend is not None and previous_trend != latest_trend)):
                 logger.debug(
                     f"Opening new position: force_first_trade={force_first_trade}, closed_candle_count={closed_candle_count}, previous_trend={previous_trend}, latest_trend={latest_trend}")
-                if latest_trend ==
+                if latest_trend == 1:
+                    logger.debug("Opening LONG position")
+                    market_order = bybit_client.place_order(
+                        category="linear",
+                        symbol=BYBIT_TRADING_PAIR,
+                        side="Buy",
+                        orderType="Market",
+                        qty=str(adjusted_quantity)
+                    )
+                    logger.debug(f"Market order response: {market_order}")
+                    if market_order['retCode'] != 0:
+                        raise Exception(f"Failed to place market order: {market_order['retMsg']}")
+
+                    # Sync position immediately to confirm it was opened
+                    bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
+                    if not bybit_position:
+                        logger.error("Failed to confirm new LONG position after placing order.")
+                        raise Exception("Failed to confirm new LONG position after placing order.")
+
+                    # Set stop-loss immediately after confirming the position
+                    stop_loss_order_id = update_stop_loss(
+                        bybit_client,
+                        BYBIT_TRADING_PAIR,
+                        'LONG',
+                        adjusted_stop_price,
+                        None,
+                        latest_close,
+                        POSITION_SIZE,
+                        is_new_position=True
+                    )
+                    current_position = {
+                        'side': 'LONG',
+                        'entry_price': bybit_position['entry_price'],
+                        'size': adjusted_quantity,
+                        'stop_loss': adjusted_stop_price,
+                        'trend': latest_trend,
+                        'open_time': str(datetime.now(timezone.utc)),
+                        'order_id': market_order['result']['orderId'],
+                        'stop_loss_order_id': stop_loss_order_id
+                    }
+                    logger.info(
+                        f"{Fore.GREEN}Opened LONG at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+                    # Write the new position to the database immediately
+                    write_position_to_db(conn, current_position)
+
+                elif latest_trend == -1:
+                    logger.debug("Opening SHORT position")
+                    market_order = bybit_client.place_order(
+                        category="linear",
+                        symbol=BYBIT_TRADING_PAIR,
+                        side="Sell",
+                        orderType="Market",
+                        qty=str(adjusted_quantity)
+                    )
+                    logger.debug(f"Market order response: {market_order}")
+                    if market_order['retCode'] != 0:
+                        raise Exception(f"Failed to place market order: {market_order['retMsg']}")
+
+                    # Sync position immediately to confirm it was opened
+                    bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
+                    if not bybit_position:
+                        logger.error("Failed to confirm new SHORT position after placing order.")
+                        raise Exception("Failed to confirm new SHORT position after placing order.")
+
+                    # Set stop-loss immediately after confirming the position
+                    stop_loss_order_id = update_stop_loss(
+                        bybit_client,
+                        BYBIT_TRADING_PAIR,
+                        'SHORT',
+                        adjusted_stop_price,
+                        None,
+                        latest_close,
+                        POSITION_SIZE,
+                        is_new_position=True
+                    )
+                    current_position = {
+                        'side': 'SHORT',
+                        'entry_price': bybit_position['entry_price'],
+                        'size': adjusted_quantity,
+                        'stop_loss': adjusted_stop_price,
+                        'trend': latest_trend,
+                        'open_time': str(datetime.now(timezone.utc)),
+                        'order_id': market_order['result']['orderId'],
+                        'stop_loss_order_id': stop_loss_order_id
+                    }
+                    logger.info(
+                        f"{Fore.GREEN}Opened SHORT at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+                    # Write the new position to the database immediately
+                    write_position_to_db(conn, current_position)
+
+            logger.debug(
+                f"Current Position: {current_position}, Latest Trend: {latest_trend}, Previous Trend: {previous_trend}")
+
+            previous_trend = latest_trend
+            display_trade_summary(current_position, latest_close, latest_line_st)
+
+    except Exception as e:
+        logger.error(f"{Fore.RED}Error in WebSocket message: {str(e)}{Style.RESET_ALL}")
 
 
 def on_error(ws, error):
