@@ -17,7 +17,7 @@ from pybit.unified_trading import HTTP
 init()
 
 # Script Version
-SCRIPT_VERSION = "2.8.7"  # Added debug logging for database writes
+SCRIPT_VERSION = "2.8.6"  # Add write_position_to_db Calls in on_message / To fix the wrong or missing database entries
 
 # Set up logging with dual handlers
 logger = logging.getLogger(__name__)
