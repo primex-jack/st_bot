@@ -715,7 +715,14 @@ def on_message(ws, message):
                             current_position['size'] - okx_position['size']) > 0.0001:
                         logger.warning(
                             f"{Fore.YELLOW}Position mismatch detected. Updating from OKX: {okx_position}{Style.RESET_ALL}")
+                        # Preserve order_id by updating current_position instead of overwriting
+                        if current_position:
+                            order_id = current_position.get('order_id')
+                        else:
+                            order_id = None
                         current_position = okx_position
+                        if order_id:
+                            current_position['order_id'] = order_id
                 elif okx_position is None and current_position:
                     logger.warning("No position on OKX. Clearing local state.")
                     current_position = None
