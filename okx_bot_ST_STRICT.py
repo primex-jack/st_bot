@@ -22,7 +22,7 @@ from okx.PublicData import PublicAPI
 init()
 
 # Script Version
-SCRIPT_VERSION = "2.8.6"  # Add write_position_to_db Calls in on_message / To fix the wrong or missing database entries
+SCRIPT_VERSION = "2.8.7"  # Add write_position_to_db Calls in on_message / To fix the wrong or missing database entries
 
 # Set up logging with dual handlers
 logger = logging.getLogger(__name__)
