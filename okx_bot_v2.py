@@ -25,7 +25,7 @@ from okx.PublicData import PublicAPI
 init()
 
 # Script Version
-SCRIPT_VERSION = "2.0.10" #123
+SCRIPT_VERSION = "2.0.12" #123
 
 # Set up logging with dual handlers
 logger = logging.getLogger(__name__)
@@ -271,14 +271,27 @@ def init_db():
                    current_position['entry_price'], current_position['size'], current_position.get('stop_loss'),
                    current_position.get('stop_loss_order_id'), current_position.get('order_id'), current_position['position_id']))
         # Set stop-loss if none exists
-        stop_loss = latest_st_line - STOP_LOSS_OFFSET if latest_trend == 1 else latest_st_line + STOP_LOSS_OFFSET
-        if stop_loss:
+        if not current_position.get('stop_loss') and latest_st_line is not None and latest_trend is not None:
+            stop_loss = latest_st_line - STOP_LOSS_OFFSET if latest_trend == 1 else latest_st_line + STOP_LOSS_OFFSET
             stop_loss_order_id = update_stop_loss(
                 okx_trade_api, OKX_TRADING_PAIR, current_position['side'],
                 adjust_price(stop_loss, symbol_config), None,
                 current_position['entry_price'], current_position['size'], okx_public_api, is_new_position=True)
             if stop_loss_order_id:
                 logger.info(f"Placed stop-loss order ID: {stop_loss_order_id} at {stop_loss}")
+                current_position['stop_loss'] = stop_loss
+                current_position['stop_loss_order_id'] = stop_loss_order_id
+                c.execute("UPDATE trades SET stop_loss = ?, stop_loss_order_id = ? WHERE position_id = ?",
+                          (stop_loss, stop_loss_order_id, current_position['position_id']))
+        elif not current_position.get('stop_loss'):
+            # Fallback: Use entry price minus/plus a percentage if no ST line
+            stop_loss = current_position['entry_price'] * (1 - 0.05) if current_position['side'] == 'LONG' else current_position['entry_price'] * (1 + 0.05)
+            stop_loss_order_id = update_stop_loss(
+                okx_trade_api, OKX_TRADING_PAIR, current_position['side'],
+                adjust_price(stop_loss, symbol_config), None,
+                current_position['entry_price'], current_position['size'], okx_public_api, is_new_position=True)
+            if stop_loss_order_id:
+                logger.info(f"Placed fallback stop-loss order ID: {stop_loss_order_id} at {stop_loss}")
                 current_position['stop_loss'] = stop_loss
                 current_position['stop_loss_order_id'] = stop_loss_order_id
                 c.execute("UPDATE trades SET stop_loss = ?, stop_loss_order_id = ? WHERE position_id = ?",
@@ -344,7 +357,7 @@ def init_db():
             conn.commit()
     else:
         logger.info("No open position, skipping historical order sync")
-    return conn  # Return open connection
+    return conn
 
 
 # Log error to database
@@ -892,6 +905,13 @@ def order_websocket_handler(conn):
                         }
                         redis_client.rpush(f"bot_{BOT_INSTANCE_ID}_fill_queue", json.dumps(fill_data))
                         logger.info(f"Pushed fill event to Redis: {fill_data}")
+                        conn_poll.close()
+                    elif order['state'] in ['canceled', 'rejected'] and order.get('reduceOnly', 'false') == 'true':
+                        logger.warning(f"TP order {order['ordId']} {order['state']}: {order.get('sMsg', 'No message')}")
+                        conn_poll = sqlite3.connect('trade_history_v2.db', timeout=10)
+                        c = conn_poll.cursor()
+                        c.execute("UPDATE take_profits SET status = ? WHERE order_id = ?", (order['state'], order['ordId']))
+                        conn_poll.commit()
                         conn_poll.close()
                     elif order['state'] == 'filled' and order['ordType'] == 'limit' and order.get('reduceOnly', 'false') == 'true':
                         conn_poll = sqlite3.connect('trade_history_v2.db', timeout=10)
