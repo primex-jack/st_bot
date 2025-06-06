@@ -413,17 +413,32 @@ def load_symbol_config(symbol, public_api):
 
 # Adjust quantity to match OKX precision
 def adjust_quantity(quantity, symbol_config, price):
-    """Adjust quantity to match OKX precision and minimum size, return XRP units."""
-    contract_size = symbol_config['contractSize']
-    lot_size = symbol_config.get('lotSize', 1.0)
-    precision = symbol_config['quantityPrecision']
-    min_qty = symbol_config['minQty']
-    min_notional = symbol_config['minNotional']
-    min_qty_notional = max(min_qty, min_notional / price)
+    """Adjust quantity to match OKX precision and minimum size, return asset units.
+
+    Args:
+        quantity (float): Quantity in asset units (e.g., 100 XRP, 0.01 BTC).
+        symbol_config (dict): Symbol configuration with contractSize, lotSize, quantityPrecision, minQty, minNotional.
+        price (float): Current price in USDT/asset (e.g., 2.17 for XRP).
+
+    Returns:
+        float: Adjusted quantity in asset units.
+    """
+    contract_size = symbol_config['contractSize']  # e.g., 0.01 for XRP, 0.1 for BTC
+    lot_size = symbol_config.get('lotSize', 1.0)  # Contract multiples
+    precision = symbol_config['quantityPrecision']  # Decimal places for contracts
+    min_qty = symbol_config['minQty']  # Minimum contracts
+    min_notional = symbol_config['minNotional']  # Minimum USDT value
+    min_qty_notional = max(min_qty, min_notional / price / contract_size)  # Min contracts
+
+    # Input quantity is in asset units (e.g., 100 XRP)
+    asset_size = quantity
+    logger.debug(f"Initial asset size: {asset_size:.4f} units")
 
     # Convert to contracts
-    contracts = quantity / contract_size
-    # Convert to lots and round to nearest lot size multiple
+    contracts = asset_size / contract_size  # e.g., 100 XRP / 0.01 = 10,000 contracts
+    logger.debug(f"Initial contracts: {contracts:.4f}")
+
+    # Adjust to lot size multiple
     lots = contracts / lot_size
     rounded_lots = round(max(lots, min_qty_notional / lot_size))
     adjusted_contracts = rounded_lots * lot_size
@@ -433,10 +448,12 @@ def adjust_quantity(quantity, symbol_config, price):
     adjusted = round(adjusted / lot_size) * lot_size
     if adjusted < min_qty:
         adjusted = min_qty
-        logger.debug(f"Adjusted quantity increased to meet minQty: {adjusted}")
-    xrp_size = adjusted * contract_size
-    logger.debug(f"Adjusted quantity: {adjusted} contracts = {xrp_size} XRP")
-    return xrp_size
+        logger.debug(f"Adjusted quantity increased to meet minQty: {adjusted} contracts")
+
+    # Convert back to asset units
+    final_asset_size = adjusted * contract_size
+    logger.debug(f"Adjusted quantity: {adjusted} contracts = {final_asset_size:.4f} asset units")
+    return final_asset_size
 
 
 # Adjust price to match OKX precision
@@ -604,7 +621,7 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
     """Place multiple limit orders based on trend and ST_LINE."""
     global pending_orders
     min_range, max_range = ORDERS_RANGE[1] / 100, ORDERS_RANGE[0] / 100
-    base_size = POSITION_SIZE / ORDERS_PER_TRADE
+    base_size = POSITION_SIZE / ORDERS_PER_TRADE  # Asset units, e.g., 100 XRP
 
     try:
         db_conn = sqlite3.connect('trade_history_v2.db', timeout=10)
@@ -638,19 +655,20 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
         orders = []
         for i in range(ORDERS_PER_TRADE):
             price = base_price + (i / (ORDERS_PER_TRADE - 1)) * price_range if ORDERS_PER_TRADE > 1 else base_price
-            size = base_size * (1 + random.uniform(-0.1, 0.1))
+            size = base_size * (1 + random.uniform(-0.1, 0.1))  # Asset units, e.g., 90–110 XRP
             price = adjust_price(price, symbol_config)
-            size = adjust_quantity(size, symbol_config, price)
-            logger.debug(f"Preparing order: {side} at {price} with size {size} XRP")
+            asset_size = adjust_quantity(size, symbol_config, price)  # Returns asset units
+            contract_size = asset_size / symbol_config['contractSize']  # Convert to contracts
+            logger.debug(f"Preparing order: {side} at {price} with size {asset_size:.4f} asset units ({contract_size:.2f} contracts)")
             orders.append({
                 'instId': OKX_TRADING_PAIR,
                 'tdMode': 'isolated',
                 'side': side,
                 'ordType': 'limit',
                 'px': str(price),
-                'sz': str(size / symbol_config['contractSize'])
+                'sz': str(contract_size)
             })
-            pending_orders.append({'price': price, 'size': size, 'side': side, 'position_id': None})
+            pending_orders.append({'price': price, 'size': asset_size, 'side': side, 'position_id': None})
 
         batch_result = okx_trade_api.place_multiple_orders(orders)
         placed_count = 0
@@ -697,45 +715,77 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
 
 
 # Place take-profit orders
-def place_tp_orders(filled_order, conn, symbol_config):
-    """Place take-profit orders for a filled limit order."""
-    entry_price = filled_order['price']
-    size = filled_order['size']
-    side = 'sell' if filled_order['side'] == 'buy' else 'buy'
+def place_tp_orders(fill_data, conn, symbol_config):
+    """Place take-profit orders for a filled order."""
+    try:
+        db_conn = sqlite3.connect('trade_history_v2.db', timeout=10)
+        c = db_conn.cursor()
+        c.execute("SELECT id FROM bot_runs ORDER BY id DESC LIMIT 1")
+        run_id = c.fetchone()[0]
 
-    c = conn.cursor()
-    orders = []
-    for i in range(TP_LEVELS):
-        tp_price = entry_price * (1 + TP_PERCENTAGES[i] / 100) if side == 'sell' else entry_price * (
-                    1 - TP_PERCENTAGES[i] / 100)
-        tp_size = size / TP_LEVELS
-        tp_price = adjust_price(tp_price, symbol_config)
-        tp_size = adjust_quantity(tp_size, symbol_config, tp_price)
-        orders.append({
-            'instId': OKX_TRADING_PAIR,
-            'tdMode': 'isolated',
-            'side': side,
-            'ordType': 'limit',
-            'px': str(tp_price),
-            'sz': str(tp_size),
-            'reduceOnly': 'true'
-        })
+        fill_size = fill_data['size']  # Asset units, e.g., 109 XRP
+        fill_price = fill_data['price']  # e.g., 2.1735 USDT/XRP
+        side = 'sell' if fill_data['side'] == 'buy' else 'buy'  # Reduce-only opposite side
+        position_id = fill_data.get('position_id')
 
-    batch_result = okx_trade_api.place_multiple_orders(orders)
-    if batch_result['code'] != "0":
-        logger.error(f"Failed to place TP orders: {batch_result['msg']}")
-        log_error(conn, batch_result['msg'], "place_tp_orders")
-        return
+        tp_percentages = [float(p) for p in TP_PERCENTAGES.split(',')]  # e.g., [1, 2, 3, 4, 5]
+        tp_size = fill_size / len(tp_percentages)  # e.g., 109 / 5 ≈ 21.8 XRP per level
+        min_qty = symbol_config['minQty'] * symbol_config['contractSize']  # Min asset units
+        min_notional = symbol_config['minNotional']  # Min USDT value
 
-    for order_data, order in zip(batch_result['data'], orders):
-        if order_data['sCode'] == "0":
-            order_id = order_data['ordId']
-            c.execute('''INSERT INTO take_profits (trade_id, tp_level, order_id, price, size, status, timestamp)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                      (1, i + 1, order_id, float(order['px']), float(order['sz']), 'pending',
-                       str(datetime.now(timezone.utc))))
-    conn.commit()
-    logger.info(f"Placed {TP_LEVELS} TP orders for filled order")
+        orders = []
+        for i, percentage in enumerate(tp_percentages):
+            tp_price = fill_price * (1 + percentage / 100) if fill_data['side'] == 'buy' else fill_price * (1 - percentage / 100)
+            tp_price = adjust_price(tp_price, symbol_config)
+            tp_size_adjusted = adjust_quantity(tp_size, symbol_config, tp_price)  # Ensure compliance
+            if tp_size_adjusted * tp_price < min_notional or tp_size_adjusted < min_qty:
+                logger.warning(f"TP order size {tp_size_adjusted:.4f} at {tp_price} below minQty or minNotional, skipping")
+                continue
+            contract_size = tp_size_adjusted / symbol_config['contractSize']  # Convert to contracts
+            logger.debug(f"Preparing TP order: {side} at {tp_price} with size {tp_size_adjusted:.4f} asset units ({contract_size:.2f} contracts)")
+            orders.append({
+                'instId': OKX_TRADING_PAIR,
+                'tdMode': 'isolated',
+                'side': side,
+                'ordType': 'limit',
+                'px': str(tp_price),
+                'sz': str(contract_size),
+                'reduceOnly': 'true'
+            })
+
+        if not orders:
+            logger.warning("No valid TP orders to place")
+            return
+
+        batch_result = okx_trade_api.place_multiple_orders(orders)
+        placed_count = 0
+        if batch_result['code'] != "0":
+            logger.error(f"Failed to place TP orders: {batch_result['msg']}")
+            log_error(f"Failed to place TP orders: {batch_result['msg']}", "place_tp_orders")
+            return
+
+        c = db_conn.cursor()
+        for order_data, order in zip(batch_result['data'], orders):
+            if order_data['sCode'] == "0":
+                order_id = order_data['ordId']
+                c.execute('''INSERT INTO take_profits (trade_id, tp_level, order_id, price, size, status, timestamp, position_id, run_id)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                          (1, placed_count + 1, order_id, float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'],
+                           'pending', str(datetime.now(timezone.utc)), position_id, run_id))
+                placed_count += 1
+            else:
+                logger.warning(f"TP order failed: {order_data['sMsg']} (Price: {order_data.get('px')}, Size: {order_data.get('sz')})")
+        db_conn.commit()
+        if placed_count > 0:
+            logger.info(f"Placed {placed_count} TP orders for filled order")
+        else:
+            logger.warning("No TP orders placed due to failures")
+    except Exception as e:
+        logger.error(f"Error in place_tp_orders: {str(e)}")
+        log_error(str(e), "place_tp_orders")
+    finally:
+        if 'db_conn' in locals():
+            db_conn.close()
 
 
 # Refill position after TP hit
