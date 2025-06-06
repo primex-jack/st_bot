@@ -17,7 +17,11 @@ from pybit.unified_trading import HTTP
 init()
 
 # Script Version
-SCRIPT_VERSION = "2.8.7"  # Added write_position_to_db Calls in on_message / To fix the wrong or missing database entries
+SCRIPT_VERSION = "2.9.0"  # Added MAX order size checking and added market order to fill the max size, rest we place chase limit orders
+# IMPROVMENT OF THIS WOULD BE TO INTEGRATE Function to Fetch Max Market Order Quantity GET /v5/market/instruments-info TO WATCHDOG INSTEAD.
+# THIS VERSION IS NOT TESTED
+# MODE 2 WE COULD BUILD MARKET ORDERS ONLY IN BATCHES - SOMETHING TO CONSIDER.
+
 
 # Set up logging with dual handlers
 logger = logging.getLogger(__name__)
@@ -137,6 +141,20 @@ trade_history = []
 
 # File paths
 SYMBOL_CONFIG_FILE = 'bybit_symbol_configs.json'
+
+def get_max_market_order_quantity(client, symbol):
+    try:
+        response = client.get_instruments_info(category="linear", symbol=symbol)
+        if response['retCode'] != 0:
+            logger.error(f"Failed to fetch instrument info: {response['retMsg']}")
+            return None
+        instrument = response['result']['list'][0]
+        max_market_qty = float(instrument['lotSizeFilter']['maxMarketOrderQty'])
+        logger.debug(f"Max market order quantity for {symbol}: {max_market_qty}")
+        return max_market_qty
+    except Exception as e:
+        logger.error(f"Error fetching max market order quantity for {symbol}: {e}")
+        return None
 
 # Helper function to write current_position to the database
 def write_position_to_db(conn, position):
@@ -802,62 +820,98 @@ def on_message(ws, message):
                         cancel_all_stop_loss_orders(bybit_client, BYBIT_TRADING_PAIR)
                         logger.debug("Attempting to close LONG position")
                         try:
-                            close_order = bybit_client.place_order(
-                                category="linear",
-                                symbol=BYBIT_TRADING_PAIR,
-                                side="Sell",
-                                orderType="Market",
-                                qty=str(adjusted_quantity),
-                                reduceOnly=True
-                            )
-                            logger.debug(f"Close position response: {close_order}")
-                            if close_order['retCode'] != 0:
-                                if close_order['retCode'] == 110017:  # Current position is zero
-                                    logger.warning(
-                                        f"Position already closed on Bybit (ErrCode: 110017). Clearing local state.")
-                                    # Update database to close any active trades
-                                    c = conn.cursor()
-                                    c.execute("UPDATE trades SET exit_price = 0 WHERE trading_pair = ? AND exit_price IS NULL", (TRADING_PAIR,))
-                                    if c.rowcount > 0:
-                                        logger.info(f"Closed {c.rowcount} stale active trades in database for {TRADING_PAIR} (position already closed)")
-                                    conn.commit()
-                                    current_position = None
-                                else:
-                                    logger.error(f"Failed to close position: {close_order['retMsg']}")
-                                    raise Exception(f"Failed to close position: {close_order['retMsg']}")
+                            # Fetch max market order quantity
+                            max_market_qty = get_max_market_order_quantity(bybit_client, BYBIT_TRADING_PAIR)
+                            if max_market_qty is None:
+                                max_market_qty = adjusted_quantity
+                            # Split the order: market order for max quantity, Chase Limit for the rest
+                            total_qty = adjusted_quantity
+                            market_qty = min(total_qty, max_market_qty)
+                            chase_qty = total_qty - market_qty
+                            last_order_id = None
+
+                            # Place market order for max quantity if applicable
+                            if market_qty > 0:
+                                market_order = bybit_client.place_order(
+                                    category="linear",
+                                    symbol=BYBIT_TRADING_PAIR,
+                                    side="Sell",
+                                    orderType="Market",
+                                    qty=str(market_qty),
+                                    reduceOnly=True
+                                )
+                                logger.debug(f"Market close order response: {market_order}")
+                                if market_order['retCode'] != 0:
+                                    if market_order['retCode'] == 110017:  # Current position is zero
+                                        logger.warning(
+                                            f"Position already closed on Bybit (ErrCode: 110017). Clearing local state.")
+                                        c = conn.cursor()
+                                        c.execute("UPDATE trades SET exit_price = 0 WHERE trading_pair = ? AND exit_price IS NULL", (TRADING_PAIR,))
+                                        if c.rowcount > 0:
+                                            logger.info(f"Closed {c.rowcount} stale active trades in database for {TRADING_PAIR} (position already closed)")
+                                        conn.commit()
+                                        current_position = None
+                                    else:
+                                        logger.error(f"Failed to close position with market order: {market_order['retMsg']}")
+                                        raise Exception(f"Failed to close position with market order: {market_order['retMsg']}")
+                                last_order_id = market_order['result']['orderId']
+
+                            # Place Chase Limit Orders for the remaining quantity
+                            if chase_qty > 0:
+                                max_limit_qty = get_max_limit_order_quantity(bybit_client, BYBIT_TRADING_PAIR)
+                                if max_limit_qty is None:
+                                    max_limit_qty = chase_qty
+                                remaining_qty = chase_qty
+                                while remaining_qty > 0:
+                                    qty_to_order = min(remaining_qty, max_limit_qty)
+                                    chase_order = bybit_client.place_order(
+                                        category="linear",
+                                        symbol=BYBIT_TRADING_PAIR,
+                                        side="Sell",
+                                        orderType="Limit",
+                                        qty=str(qty_to_order),
+                                        reduceOnly=True,
+                                        timeInForce="PostOnly",
+                                        positionIdx=0,
+                                        orderFilter="ChaseLimitOrder"
+                                    )
+                                    logger.debug(f"Chase Limit close order response: {chase_order}")
+                                    if chase_order['retCode'] != 0:
+                                        logger.error(f"Failed to place Chase Limit Order: {chase_order['retMsg']}")
+                                        raise Exception(f"Failed to place Chase Limit Order: {chase_order['retMsg']}")
+                                    remaining_qty -= qty_to_order
+                                    last_order_id = chase_order['result']['orderId']
+                                    time.sleep(1)  # Avoid rate limits
+
+                            trade = {
+                                'timestamp': str(datetime.now(timezone.utc)),
+                                'trading_pair': TRADING_PAIR,
+                                'timeframe': TIMEFRAME,
+                                'side': 'LONG',
+                                'entry_price': current_position['entry_price'],
+                                'size': current_position['size'],
+                                'exit_price': latest_close,
+                                'profit_loss': (latest_close - current_position['entry_price']) * current_position['size'],
+                                'trend': latest_trend,
+                                'order_id': last_order_id,
+                                'stop_loss_order_id': current_position.get('stop_loss_order_id')
+                            }
+                            trade_history.append(trade)
+                            log_trade(conn, trade)
+                            bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
+                            if not bybit_position:
+                                logger.info("Position successfully closed. Opening new SHORT position.")
+                                current_position = None
                             else:
-                                trade = {
-                                    'timestamp': str(datetime.now(timezone.utc)),
-                                    'trading_pair': TRADING_PAIR,
-                                    'timeframe': TIMEFRAME,
-                                    'side': 'LONG',
-                                    'entry_price': current_position['entry_price'],
-                                    'size': current_position['size'],
-                                    'exit_price': latest_close,
-                                    'profit_loss': (latest_close - current_position['entry_price']) * current_position[
-                                        'size'],
-                                    'trend': latest_trend,
-                                    'order_id': close_order['result']['orderId'],
-                                    'stop_loss_order_id': current_position.get('stop_loss_order_id')
-                                }
-                                trade_history.append(trade)
-                                log_trade(conn, trade)
-                                bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
-                                if not bybit_position:
-                                    logger.info("Position successfully closed. Opening new SHORT position.")
-                                    current_position = None
-                                else:
-                                    logger.warning(f"Position still exists after closing attempt: {bybit_position}")
-                                    current_position = bybit_position
-                                    # Write the updated position to the database
-                                    write_position_to_db(conn, current_position)
-                                    display_trade_summary(current_position, latest_close, latest_line_st)
-                                    return
+                                logger.warning(f"Position still exists after closing attempt: {bybit_position}")
+                                current_position = bybit_position
+                                write_position_to_db(conn, current_position)
+                                display_trade_summary(current_position, latest_close, latest_line_st)
+                                return
                         except Exception as e:
                             if "current position is zero" in str(e):
                                 logger.warning(
                                     f"Position already closed on Bybit (ErrCode: 110017). Clearing local state.")
-                                # Update database to close any active trades
                                 c = conn.cursor()
                                 c.execute("UPDATE trades SET exit_price = 0 WHERE trading_pair = ? AND exit_price IS NULL", (TRADING_PAIR,))
                                 if c.rowcount > 0:
@@ -869,16 +923,52 @@ def on_message(ws, message):
 
                         if current_position is None:
                             logger.debug("Opening new SHORT position")
-                            market_order = bybit_client.place_order(
-                                category="linear",
-                                symbol=BYBIT_TRADING_PAIR,
-                                side="Sell",
-                                orderType="Market",
-                                qty=str(adjusted_quantity)
-                            )
-                            logger.debug(f"Market order response: {market_order}")
-                            if market_order['retCode'] != 0:
-                                raise Exception(f"Failed to place market order: {market_order['retMsg']}")
+                            max_market_qty = get_max_market_order_quantity(bybit_client, BYBIT_TRADING_PAIR)
+                            if max_market_qty is None:
+                                max_market_qty = adjusted_quantity
+                            total_qty = adjusted_quantity
+                            market_qty = min(total_qty, max_market_qty)
+                            chase_qty = total_qty - market_qty
+                            last_order_id = None
+
+                            # Place market order for max quantity if applicable
+                            if market_qty > 0:
+                                market_order = bybit_client.place_order(
+                                    category="linear",
+                                    symbol=BYBIT_TRADING_PAIR,
+                                    side="Sell",
+                                    orderType="Market",
+                                    qty=str(market_qty)
+                                )
+                                logger.debug(f"Market order response: {market_order}")
+                                if market_order['retCode'] != 0:
+                                    raise Exception(f"Failed to place market order: {market_order['retMsg']}")
+                                last_order_id = market_order['result']['orderId']
+
+                            # Place Chase Limit Orders for the remaining quantity
+                            if chase_qty > 0:
+                                max_limit_qty = get_max_limit_order_quantity(bybit_client, BYBIT_TRADING_PAIR)
+                                if max_limit_qty is None:
+                                    max_limit_qty = chase_qty
+                                remaining_qty = chase_qty
+                                while remaining_qty > 0:
+                                    qty_to_order = min(remaining_qty, max_limit_qty)
+                                    chase_order = bybit_client.place_order(
+                                        category="linear",
+                                        symbol=BYBIT_TRADING_PAIR,
+                                        side="Sell",
+                                        orderType="Limit",
+                                        qty=str(qty_to_order),
+                                        timeInForce="PostOnly",
+                                        positionIdx=0,
+                                        orderFilter="ChaseLimitOrder"
+                                    )
+                                    logger.debug(f"Chase Limit Order response: {chase_order}")
+                                    if chase_order['retCode'] != 0:
+                                        raise Exception(f"Failed to place Chase Limit Order: {chase_order['retMsg']}")
+                                    remaining_qty -= qty_to_order
+                                    last_order_id = chase_order['result']['orderId']
+                                    time.sleep(1)  # Avoid rate limits
 
                             # Sync position immediately to confirm it was opened
                             bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
@@ -904,11 +994,11 @@ def on_message(ws, message):
                                 'stop_loss': adjusted_stop_price,
                                 'trend': latest_trend,
                                 'open_time': str(datetime.now(timezone.utc)),
-                                'order_id': market_order['result']['orderId'],
+                                'order_id': last_order_id,
                                 'stop_loss_order_id': stop_loss_order_id
                             }
                             logger.info(
-                                f"{Fore.GREEN}Reversed to SHORT at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+                                f"{Fore.GREEN}Opened SHORT at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
                             # Write the new position to the database immediately
                             write_position_to_db(conn, current_position)
 
@@ -916,62 +1006,96 @@ def on_message(ws, message):
                         cancel_all_stop_loss_orders(bybit_client, BYBIT_TRADING_PAIR)
                         logger.debug("Attempting to close SHORT position")
                         try:
-                            close_order = bybit_client.place_order(
-                                category="linear",
-                                symbol=BYBIT_TRADING_PAIR,
-                                side="Buy",
-                                orderType="Market",
-                                qty=str(adjusted_quantity),
-                                reduceOnly=True
-                            )
-                            logger.debug(f"Close position response: {close_order}")
-                            if close_order['retCode'] != 0:
-                                if close_order['retCode'] == 110017:  # Current position is zero
-                                    logger.warning(
-                                        f"Position already closed on Bybit (ErrCode: 110017). Clearing local state.")
-                                    # Update database to close any active trades
-                                    c = conn.cursor()
-                                    c.execute("UPDATE trades SET exit_price = 0 WHERE trading_pair = ? AND exit_price IS NULL", (TRADING_PAIR,))
-                                    if c.rowcount > 0:
-                                        logger.info(f"Closed {c.rowcount} stale active trades in database for {TRADING_PAIR} (position already closed)")
-                                    conn.commit()
-                                    current_position = None
-                                else:
-                                    logger.error(f"Failed to close position: {close_order['retMsg']}")
-                                    raise Exception(f"Failed to close position: {close_order['retMsg']}")
+                            max_market_qty = get_max_market_order_quantity(bybit_client, BYBIT_TRADING_PAIR)
+                            if max_market_qty is None:
+                                max_market_qty = adjusted_quantity
+                            total_qty = adjusted_quantity
+                            market_qty = min(total_qty, max_market_qty)
+                            chase_qty = total_qty - market_qty
+                            last_order_id = None
+
+                            # Place market order for max quantity if applicable
+                            if market_qty > 0:
+                                close_order = bybit_client.place_order(
+                                    category="linear",
+                                    symbol=BYBIT_TRADING_PAIR,
+                                    side="Buy",
+                                    orderType="Market",
+                                    qty=str(market_qty),
+                                    reduceOnly=True
+                                )
+                                logger.debug(f"Market close order response: {close_order}")
+                                if close_order['retCode'] != 0:
+                                    if close_order['retCode'] == 110017:  # Current position is zero
+                                        logger.warning(
+                                            f"Position already closed on Bybit (ErrCode: 110017). Clearing local state.")
+                                        c = conn.cursor()
+                                        c.execute("UPDATE trades SET exit_price = 0 WHERE trading_pair = ? AND exit_price IS NULL", (TRADING_PAIR,))
+                                        if c.rowcount > 0:
+                                            logger.info(f"Closed {c.rowcount} stale active trades in database for {TRADING_PAIR} (position already closed)")
+                                        conn.commit()
+                                        current_position = None
+                                    else:
+                                        logger.error(f"Failed to close position with market order: {close_order['retMsg']}")
+                                        raise Exception(f"Failed to close position with market order: {close_order['retMsg']}")
+                                last_order_id = close_order['result']['orderId']
+
+                            # Place Chase Limit Orders for the remaining quantity
+                            if chase_qty > 0:
+                                max_limit_qty = get_max_limit_order_quantity(bybit_client, BYBIT_TRADING_PAIR)
+                                if max_limit_qty is None:
+                                    max_limit_qty = chase_qty
+                                remaining_qty = chase_qty
+                                while remaining_qty > 0:
+                                    qty_to_order = min(remaining_qty, max_limit_qty)
+                                    chase_order = bybit_client.place_order(
+                                        category="linear",
+                                        symbol=BYBIT_TRADING_PAIR,
+                                        side="Buy",
+                                        orderType="Limit",
+                                        qty=str(qty_to_order),
+                                        reduceOnly=True,
+                                        timeInForce="PostOnly",
+                                        positionIdx=0,
+                                        orderFilter="ChaseLimitOrder"
+                                    )
+                                    logger.debug(f"Chase Limit close order response: {chase_order}")
+                                    if chase_order['retCode'] != 0:
+                                        logger.error(f"Failed to place Chase Limit Order: {chase_order['retMsg']}")
+                                        raise Exception(f"Failed to place Chase Limit Order: {chase_order['retMsg']}")
+                                    remaining_qty -= qty_to_order
+                                    last_order_id = chase_order['result']['orderId']
+                                    time.sleep(1)  # Avoid rate limits
+
+                            trade = {
+                                'timestamp': str(datetime.now(timezone.utc)),
+                                'trading_pair': TRADING_PAIR,
+                                'timeframe': TIMEFRAME,
+                                'side': 'SHORT',
+                                'entry_price': current_position['entry_price'],
+                                'size': current_position['size'],
+                                'exit_price': latest_close,
+                                'profit_loss': (current_position['entry_price'] - latest_close) * current_position['size'],
+                                'trend': latest_trend,
+                                'order_id': last_order_id,
+                                'stop_loss_order_id': current_position.get('stop_loss_order_id')
+                            }
+                            trade_history.append(trade)
+                            log_trade(conn, trade)
+                            bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
+                            if not bybit_position:
+                                logger.info("Position successfully closed. Opening new LONG position.")
+                                current_position = None
                             else:
-                                trade = {
-                                    'timestamp': str(datetime.now(timezone.utc)),
-                                    'trading_pair': TRADING_PAIR,
-                                    'timeframe': TIMEFRAME,
-                                    'side': 'SHORT',
-                                    'entry_price': current_position['entry_price'],
-                                    'size': current_position['size'],
-                                    'exit_price': latest_close,
-                                    'profit_loss': (current_position['entry_price'] - latest_close) * current_position[
-                                        'size'],
-                                    'trend': latest_trend,
-                                    'order_id': close_order['result']['orderId'],
-                                    'stop_loss_order_id': current_position.get('stop_loss_order_id')
-                                }
-                                trade_history.append(trade)
-                                log_trade(conn, trade)
-                                bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
-                                if not bybit_position:
-                                    logger.info("Position successfully closed. Opening new LONG position.")
-                                    current_position = None
-                                else:
-                                    logger.warning(f"Position still exists after closing attempt: {bybit_position}")
-                                    current_position = bybit_position
-                                    # Write the updated position to the database
-                                    write_position_to_db(conn, current_position)
-                                    display_trade_summary(current_position, latest_close, latest_line_st)
-                                    return
+                                logger.warning(f"Position still exists after closing attempt: {bybit_position}")
+                                current_position = bybit_position
+                                write_position_to_db(conn, current_position)
+                                display_trade_summary(current_position, latest_close, latest_line_st)
+                                return
                         except Exception as e:
                             if "current position is zero" in str(e):
                                 logger.warning(
                                     f"Position already closed on Bybit (ErrCode: 110017). Clearing local state.")
-                                # Update database to close any active trades
                                 c = conn.cursor()
                                 c.execute("UPDATE trades SET exit_price = 0 WHERE trading_pair = ? AND exit_price IS NULL", (TRADING_PAIR,))
                                 if c.rowcount > 0:
@@ -983,16 +1107,52 @@ def on_message(ws, message):
 
                         if current_position is None:
                             logger.debug("Opening new LONG position")
-                            market_order = bybit_client.place_order(
-                                category="linear",
-                                symbol=BYBIT_TRADING_PAIR,
-                                side="Buy",
-                                orderType="Market",
-                                qty=str(adjusted_quantity)
-                            )
-                            logger.debug(f"Market order response: {market_order}")
-                            if market_order['retCode'] != 0:
-                                raise Exception(f"Failed to place market order: {market_order['retMsg']}")
+                            max_market_qty = get_max_market_order_quantity(bybit_client, BYBIT_TRADING_PAIR)
+                            if max_market_qty is None:
+                                max_market_qty = adjusted_quantity
+                            total_qty = adjusted_quantity
+                            market_qty = min(total_qty, max_market_qty)
+                            chase_qty = total_qty - market_qty
+                            last_order_id = None
+
+                            # Place market order for max quantity if applicable
+                            if market_qty > 0:
+                                market_order = bybit_client.place_order(
+                                    category="linear",
+                                    symbol=BYBIT_TRADING_PAIR,
+                                    side="Buy",
+                                    orderType="Market",
+                                    qty=str(market_qty)
+                                )
+                                logger.debug(f"Market order response: {market_order}")
+                                if market_order['retCode'] != 0:
+                                    raise Exception(f"Failed to place market order: {market_order['retMsg']}")
+                                last_order_id = market_order['result']['orderId']
+
+                            # Place Chase Limit Orders for the remaining quantity
+                            if chase_qty > 0:
+                                max_limit_qty = get_max_limit_order_quantity(bybit_client, BYBIT_TRADING_PAIR)
+                                if max_limit_qty is None:
+                                    max_limit_qty = chase_qty
+                                remaining_qty = chase_qty
+                                while remaining_qty > 0:
+                                    qty_to_order = min(remaining_qty, max_limit_qty)
+                                    chase_order = bybit_client.place_order(
+                                        category="linear",
+                                        symbol=BYBIT_TRADING_PAIR,
+                                        side="Buy",
+                                        orderType="Limit",
+                                        qty=str(qty_to_order),
+                                        timeInForce="PostOnly",
+                                        positionIdx=0,
+                                        orderFilter="ChaseLimitOrder"
+                                    )
+                                    logger.debug(f"Chase Limit Order response: {chase_order}")
+                                    if chase_order['retCode'] != 0:
+                                        raise Exception(f"Failed to place Chase Limit Order: {chase_order['retMsg']}")
+                                    remaining_qty -= qty_to_order
+                                    last_order_id = chase_order['result']['orderId']
+                                    time.sleep(1)  # Avoid rate limits
 
                             # Sync position immediately to confirm it was opened
                             bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
@@ -1018,11 +1178,11 @@ def on_message(ws, message):
                                 'stop_loss': adjusted_stop_price,
                                 'trend': latest_trend,
                                 'open_time': str(datetime.now(timezone.utc)),
-                                'order_id': market_order['result']['orderId'],
+                                'order_id': last_order_id,
                                 'stop_loss_order_id': stop_loss_order_id
                             }
                             logger.info(
-                                f"{Fore.GREEN}Reversed to LONG at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
+                                f"{Fore.GREEN}Opened LONG at {latest_close:.2f}, Stop Loss: {adjusted_stop_price:.2f}{Style.RESET_ALL}")
                             # Write the new position to the database immediately
                             write_position_to_db(conn, current_position)
 
@@ -1084,66 +1244,101 @@ def on_message(ws, message):
                         close_side = 'Sell' if current_position['side'] == 'LONG' else 'Buy'
                         previous_side = current_position['side']  # Store the side before closing
                         try:
-                            close_order = bybit_client.place_order(
-                                category="linear",
-                                symbol=BYBIT_TRADING_PAIR,
-                                side=close_side,
-                                orderType="Market",
-                                qty=str(adjusted_quantity),
-                                reduceOnly=True
-                            )
-                            logger.debug(f"Close position response: {close_order}")
-                            if close_order['retCode'] != 0:
-                                if close_order['retCode'] == 110017:  # Current position is zero
-                                    logger.warning(
-                                        f"Position already closed on Bybit (ErrCode: 110017). Clearing local state.")
-                                    # Update database to close any active trades
-                                    c = conn.cursor()
-                                    c.execute("UPDATE trades SET exit_price = 0 WHERE trading_pair = ? AND exit_price IS NULL", (TRADING_PAIR,))
-                                    if c.rowcount > 0:
-                                        logger.info(f"Closed {c.rowcount} stale active trades in database for {TRADING_PAIR} (position already closed)")
-                                    conn.commit()
-                                    current_position = None
-                                else:
-                                    logger.error(f"Failed to close position: {close_order['retMsg']}")
-                                    raise Exception(f"Failed to close position: {close_order['retMsg']}")
+                            max_market_qty = get_max_market_order_quantity(bybit_client, BYBIT_TRADING_PAIR)
+                            if max_market_qty is None:
+                                max_market_qty = adjusted_quantity
+                            total_qty = adjusted_quantity
+                            market_qty = min(total_qty, max_market_qty)
+                            chase_qty = total_qty - market_qty
+                            last_order_id = None
+
+                            # Place market order for max quantity if applicable
+                            if market_qty > 0:
+                                close_order = bybit_client.place_order(
+                                    category="linear",
+                                    symbol=BYBIT_TRADING_PAIR,
+                                    side=close_side,
+                                    orderType="Market",
+                                    qty=str(market_qty),
+                                    reduceOnly=True
+                                )
+                                logger.debug(f"Market close order response: {close_order}")
+                                if close_order['retCode'] != 0:
+                                    if close_order['retCode'] == 110017:  # Current position is zero
+                                        logger.warning(
+                                            f"Position already closed on Bybit (ErrCode: 110017). Clearing local state.")
+                                        c = conn.cursor()
+                                        c.execute("UPDATE trades SET exit_price = 0 WHERE trading_pair = ? AND exit_price IS NULL", (TRADING_PAIR,))
+                                        if c.rowcount > 0:
+                                            logger.info(f"Closed {c.rowcount} stale active trades in database for {TRADING_PAIR} (position already closed)")
+                                        conn.commit()
+                                        current_position = None
+                                    else:
+                                        logger.error(f"Failed to close position with market order: {close_order['retMsg']}")
+                                        raise Exception(f"Failed to close position with market order: {close_order['retMsg']}")
+                                last_order_id = close_order['result']['orderId']
+
+                            # Place Chase Limit Orders for the remaining quantity
+                            if chase_qty > 0:
+                                max_limit_qty = get_max_limit_order_quantity(bybit_client, BYBIT_TRADING_PAIR)
+                                if max_limit_qty is None:
+                                    max_limit_qty = chase_qty
+                                remaining_qty = chase_qty
+                                while remaining_qty > 0:
+                                    qty_to_order = min(remaining_qty, max_limit_qty)
+                                    chase_order = bybit_client.place_order(
+                                        category="linear",
+                                        symbol=BYBIT_TRADING_PAIR,
+                                        side=close_side,
+                                        orderType="Limit",
+                                        qty=str(qty_to_order),
+                                        reduceOnly=True,
+                                        timeInForce="PostOnly",
+                                        positionIdx=0,
+                                        orderFilter="ChaseLimitOrder"
+                                    )
+                                    logger.debug(f"Chase Limit close order response: {chase_order}")
+                                    if chase_order['retCode'] != 0:
+                                        logger.error(f"Failed to place Chase Limit Order: {chase_order['retMsg']}")
+                                        raise Exception(f"Failed to place Chase Limit Order: {chase_order['retMsg']}")
+                                    remaining_qty -= qty_to_order
+                                    last_order_id = chase_order['result']['orderId']
+                                    time.sleep(1)  # Avoid rate limits
+
+                            trade = {
+                                'timestamp': str(datetime.now(timezone.utc)),
+                                'trading_pair': TRADING_PAIR,
+                                'timeframe': TIMEFRAME,
+                                'side': previous_side,
+                                'entry_price': current_position['entry_price'],
+                                'size': current_position['size'],
+                                'exit_price': latest_close,
+                                'stop_loss': current_position.get('stop_loss'),
+                                'profit_loss': (latest_close - current_position['entry_price']) * current_position[
+                                    'size'] if previous_side == 'LONG' else (current_position[
+                                                                                 'entry_price'] - latest_close) *
+                                                                            current_position['size'],
+                                'trend': latest_trend,
+                                'order_id': last_order_id,
+                                'stop_loss_order_id': current_position.get('stop_loss_order_id')
+                            }
+                            trade_history.append(trade)
+                            log_trade(conn, trade)
+                            bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
+                            if not bybit_position:
+                                logger.info(
+                                    "Position successfully closed. Awaiting manual intervention to resume trading.")
+                                current_position = None
                             else:
-                                trade = {
-                                    'timestamp': str(datetime.now(timezone.utc)),
-                                    'trading_pair': TRADING_PAIR,
-                                    'timeframe': TIMEFRAME,
-                                    'side': previous_side,
-                                    'entry_price': current_position['entry_price'],
-                                    'size': current_position['size'],
-                                    'exit_price': latest_close,
-                                    'stop_loss': current_position.get('stop_loss'),
-                                    'profit_loss': (latest_close - current_position['entry_price']) * current_position[
-                                        'size'] if previous_side == 'LONG' else (current_position[
-                                                                                     'entry_price'] - latest_close) *
-                                                                                current_position['size'],
-                                    'trend': latest_trend,
-                                    'order_id': close_order['result']['orderId'],
-                                    'stop_loss_order_id': current_position.get('stop_loss_order_id')
-                                }
-                                trade_history.append(trade)
-                                log_trade(conn, trade)
-                                bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
-                                if not bybit_position:
-                                    logger.info(
-                                        "Position successfully closed. Awaiting manual intervention to resume trading.")
-                                    current_position = None
-                                else:
-                                    logger.warning(f"Position still exists after stop-loss trigger: {bybit_position}")
-                                    current_position = bybit_position
-                                    # Write the updated position to the database
-                                    write_position_to_db(conn, current_position)
-                                    display_trade_summary(current_position, latest_close, latest_line_st)
-                                    return
+                                logger.warning(f"Position still exists after stop-loss trigger: {bybit_position}")
+                                current_position = bybit_position
+                                write_position_to_db(conn, current_position)
+                                display_trade_summary(current_position, latest_close, latest_line_st)
+                                return
                         except Exception as e:
                             if "current position is zero" in str(e):
                                 logger.warning(
                                     f"Position already closed on Bybit (ErrCode: 110017). Clearing local state.")
-                                # Update database to close any active trades
                                 c = conn.cursor()
                                 c.execute("UPDATE trades SET exit_price = 0 WHERE trading_pair = ? AND exit_price IS NULL", (TRADING_PAIR,))
                                 if c.rowcount > 0:
@@ -1159,16 +1354,52 @@ def on_message(ws, message):
                     f"Opening new position: force_first_trade={force_first_trade}, closed_candle_count={closed_candle_count}, previous_trend={previous_trend}, latest_trend={latest_trend}")
                 if latest_trend == 1:
                     logger.debug("Opening LONG position")
-                    market_order = bybit_client.place_order(
-                        category="linear",
-                        symbol=BYBIT_TRADING_PAIR,
-                        side="Buy",
-                        orderType="Market",
-                        qty=str(adjusted_quantity)
-                    )
-                    logger.debug(f"Market order response: {market_order}")
-                    if market_order['retCode'] != 0:
-                        raise Exception(f"Failed to place market order: {market_order['retMsg']}")
+                    max_market_qty = get_max_market_order_quantity(bybit_client, BYBIT_TRADING_PAIR)
+                    if max_market_qty is None:
+                        max_market_qty = adjusted_quantity
+                    total_qty = adjusted_quantity
+                    market_qty = min(total_qty, max_market_qty)
+                    chase_qty = total_qty - market_qty
+                    last_order_id = None
+
+                    # Place market order for max quantity if applicable
+                    if market_qty > 0:
+                        market_order = bybit_client.place_order(
+                            category="linear",
+                            symbol=BYBIT_TRADING_PAIR,
+                            side="Buy",
+                            orderType="Market",
+                            qty=str(market_qty)
+                        )
+                        logger.debug(f"Market order response: {market_order}")
+                        if market_order['retCode'] != 0:
+                            raise Exception(f"Failed to place market order: {market_order['retMsg']}")
+                        last_order_id = market_order['result']['orderId']
+
+                    # Place Chase Limit Orders for the remaining quantity
+                    if chase_qty > 0:
+                        max_limit_qty = get_max_limit_order_quantity(bybit_client, BYBIT_TRADING_PAIR)
+                        if max_limit_qty is None:
+                            max_limit_qty = chase_qty
+                        remaining_qty = chase_qty
+                        while remaining_qty > 0:
+                            qty_to_order = min(remaining_qty, max_limit_qty)
+                            chase_order = bybit_client.place_order(
+                                category="linear",
+                                symbol=BYBIT_TRADING_PAIR,
+                                side="Buy",
+                                orderType="Limit",
+                                qty=str(qty_to_order),
+                                timeInForce="PostOnly",
+                                positionIdx=0,
+                                orderFilter="ChaseLimitOrder"
+                            )
+                            logger.debug(f"Chase Limit Order response: {chase_order}")
+                            if chase_order['retCode'] != 0:
+                                raise Exception(f"Failed to place Chase Limit Order: {chase_order['retMsg']}")
+                            remaining_qty -= qty_to_order
+                            last_order_id = chase_order['result']['orderId']
+                            time.sleep(1)  # Avoid rate limits
 
                     # Sync position immediately to confirm it was opened
                     bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
@@ -1194,7 +1425,7 @@ def on_message(ws, message):
                         'stop_loss': adjusted_stop_price,
                         'trend': latest_trend,
                         'open_time': str(datetime.now(timezone.utc)),
-                        'order_id': market_order['result']['orderId'],
+                        'order_id': last_order_id,
                         'stop_loss_order_id': stop_loss_order_id
                     }
                     logger.info(
@@ -1204,16 +1435,52 @@ def on_message(ws, message):
 
                 elif latest_trend == -1:
                     logger.debug("Opening SHORT position")
-                    market_order = bybit_client.place_order(
-                        category="linear",
-                        symbol=BYBIT_TRADING_PAIR,
-                        side="Sell",
-                        orderType="Market",
-                        qty=str(adjusted_quantity)
-                    )
-                    logger.debug(f"Market order response: {market_order}")
-                    if market_order['retCode'] != 0:
-                        raise Exception(f"Failed to place market order: {market_order['retMsg']}")
+                    max_market_qty = get_max_market_order_quantity(bybit_client, BYBIT_TRADING_PAIR)
+                    if max_market_qty is None:
+                        max_market_qty = adjusted_quantity
+                    total_qty = adjusted_quantity
+                    market_qty = min(total_qty, max_market_qty)
+                    chase_qty = total_qty - market_qty
+                    last_order_id = None
+
+                    # Place market order for max quantity if applicable
+                    if market_qty > 0:
+                        market_order = bybit_client.place_order(
+                            category="linear",
+                            symbol=BYBIT_TRADING_PAIR,
+                            side="Sell",
+                            orderType="Market",
+                            qty=str(market_qty)
+                        )
+                        logger.debug(f"Market order response: {market_order}")
+                        if market_order['retCode'] != 0:
+                            raise Exception(f"Failed to place market order: {market_order['retMsg']}")
+                        last_order_id = market_order['result']['orderId']
+
+                    # Place Chase Limit Orders for the remaining quantity
+                    if chase_qty > 0:
+                        max_limit_qty = get_max_limit_order_quantity(bybit_client, BYBIT_TRADING_PAIR)
+                        if max_limit_qty is None:
+                            max_limit_qty = chase_qty
+                        remaining_qty = chase_qty
+                        while remaining_qty > 0:
+                            qty_to_order = min(remaining_qty, max_limit_qty)
+                            chase_order = bybit_client.place_order(
+                                category="linear",
+                                symbol=BYBIT_TRADING_PAIR,
+                                side="Sell",
+                                orderType="Limit",
+                                qty=str(qty_to_order),
+                                timeInForce="PostOnly",
+                                positionIdx=0,
+                                orderFilter="ChaseLimitOrder"
+                            )
+                            logger.debug(f"Chase Limit Order response: {chase_order}")
+                            if chase_order['retCode'] != 0:
+                                raise Exception(f"Failed to place Chase Limit Order: {chase_order['retMsg']}")
+                            remaining_qty -= qty_to_order
+                            last_order_id = chase_order['result']['orderId']
+                            time.sleep(1)  # Avoid rate limits
 
                     # Sync position immediately to confirm it was opened
                     bybit_position = sync_position_with_bybit(bybit_client, BYBIT_TRADING_PAIR)
@@ -1239,7 +1506,7 @@ def on_message(ws, message):
                         'stop_loss': adjusted_stop_price,
                         'trend': latest_trend,
                         'open_time': str(datetime.now(timezone.utc)),
-                        'order_id': market_order['result']['orderId'],
+                        'order_id': last_order_id,
                         'stop_loss_order_id': stop_loss_order_id
                     }
                     logger.info(

@@ -8,6 +8,7 @@ from datetime import datetime
 import psutil
 import sqlite3
 import argparse
+from tenacity import retry, wait_exponential, stop_after_attempt
 
 # Load configuration from config.json
 def load_config():
@@ -24,6 +25,12 @@ TELEGRAM_TOKEN = config.get('telegram_token', '')
 CHAT_ID = config.get('telegram_chat_id', '')
 TIMEFRAME = config.get('timeframe', '1m')
 BOT_NAME = config.get('bot_name', 'UnnamedBot')  # Default to 'UnnamedBot' if not specified
+# Load file paths from config with defaults
+PID_FILE = config.get('pid_file', 'bot.pid')
+BOT_LOG = config.get('bot_log', 'bot.log')
+BOT_ERRORS_LOG = config.get('bot_errors_log', 'bot_errors.log')
+LAST_PROCESSED_ID_FILE = config.get('last_processed_id_file', 'last_processed_id.txt')
+BOT_SCRIPT = config.get('bot_script', 'okx_bot_ST_STRICT.py')  # Updated to OKX bot script
 
 # Configure logging with bot name
 logging.basicConfig(
@@ -33,18 +40,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Script Version
-SCRIPT_VERSION = "2.8.1"  # Update the Watchdog Threshold in main
-
-# File paths
-BOT_SCRIPT = 'okx_bot_ST_STRICT.py'  # Updated to OKX bot script
-PID_FILE = 'bot.pid'
-BOT_LOG = 'bot.log'
-BOT_ERRORS_LOG = 'bot_errors.log'
-LAST_PROCESSED_ID_FILE = 'last_processed_id.txt'
+SCRIPT_VERSION = "2.8.2"  # Added retry logic and configurable file paths
 
 # Initialize last_start_time globally
 last_start_time = None
 
+@retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
 def send_telegram_message(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logger.warning("Telegram credentials not provided. Cannot send message.")
@@ -52,11 +53,26 @@ def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {'chat_id': CHAT_ID, 'text': f"[{BOT_NAME}] {message}"}
     try:
-        response = requests.post(url, data=payload)
+        response = requests.post(url, data=payload, timeout=10)
         response.raise_for_status()
         logger.info(f"Telegram message sent: {message}")
     except Exception as e:
         logger.error(f"Failed to send Telegram message: {e}")
+        raise
+
+def validate_telegram_credentials():
+    """Validate Telegram credentials at startup."""
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.error("Telegram token or chat ID missing in config. Notifications will not be sent.")
+        return False
+    # Test Telegram API with a simple message
+    test_message = f"Watchdog for {BOT_NAME} initialized successfully."
+    try:
+        send_telegram_message(test_message)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to validate Telegram credentials: {e}")
+        return False
 
 def is_process_running(pid):
     try:
@@ -150,6 +166,7 @@ def has_critical_error(log_file):
         logger.error(f"Error checking for critical errors in log file {log_file}: {e}")
         return False
 
+@retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
 def get_new_trades(last_processed_id):
     """Fetch new trades from the database with id > last_processed_id."""
     try:
@@ -167,7 +184,7 @@ def get_new_trades(last_processed_id):
         return rows
     except sqlite3.Error as e:
         logger.error(f"Database error: {e}")
-        return []
+        raise
 
 def start_bot(old_pid=None, force_first_trade=False):
     if old_pid:
@@ -189,6 +206,9 @@ def main(force_first_trade):
     global last_start_time
     logger.info("Watchdog started. Monitoring bot process...")
     send_telegram_message(f"Watchdog started. Monitoring bot process... (Script Version: {SCRIPT_VERSION})")
+
+    # Validate Telegram credentials
+    validate_telegram_credentials()
 
     # Initialize last_processed_id
     if os.path.exists(LAST_PROCESSED_ID_FILE):
