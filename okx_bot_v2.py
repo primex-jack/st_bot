@@ -348,10 +348,13 @@ def init_db():
 
 
 # Log error to database
+from tenacity import retry, wait_fixed, stop_after_attempt
+
+@retry(wait=wait_fixed(1), stop=stop_after_attempt(5))
 def log_error(error_message, context):
     """Log errors to the database in a thread-safe manner."""
     try:
-        conn = sqlite3.connect('trade_history_v2.db', timeout=10)
+        conn = sqlite3.connect('trade_history_v2.db', timeout=20)
         c = conn.cursor()
         c.execute('''INSERT INTO errors (timestamp, error_message, context)
                      VALUES (?, ?, ?)''',
@@ -360,6 +363,7 @@ def log_error(error_message, context):
         conn.close()
     except sqlite3.OperationalError as e:
         logger.error(f"Database error during log_error: {str(e)}")
+        raise
     except Exception as e:
         logger.error(f"Failed to log error: {str(e)}")
 
@@ -776,6 +780,8 @@ def refill_position(tp_order, st_line, trend, conn, symbol_config):
 def order_websocket_handler(conn):
     """Handle WebSocket for order fill events and push to Redis."""
     logger.info(f"Starting order WebSocket handler for {BOT_INSTANCE_ID}")
+    symbol_config = load_symbol_config(OKX_TRADING_PAIR, okx_public_api)
+
     def on_open(ws):
         logger.info(f"{Fore.BLUE}Order WebSocket opened{Style.RESET_ALL}")
         timestamp = str(int(time.time()))
@@ -824,7 +830,8 @@ def order_websocket_handler(conn):
                         conn_poll = sqlite3.connect('trade_history_v2.db', timeout=10)
                         c = conn_poll.cursor()
                         c.execute("SELECT position_id FROM orders WHERE order_id = ?", (order['ordId'],))
-                        position_id = c.fetchone()[0] if c.fetchone() else None
+                        result = c.fetchone()
+                        position_id = result[0] if result else None
                         fill_data = {
                             'order_id': order['ordId'],
                             'symbol': order['instId'],
@@ -844,7 +851,7 @@ def order_websocket_handler(conn):
                         conn_poll.close()
                         refill_position(
                             {'order_id': order['ordId'], 'size': float(order['accFillSz']) * symbol_config['contractSize']},
-                            latest_st_line, latest_trend, conn, load_symbol_config(OKX_TRADING_PAIR, okx_public_api)
+                            latest_st_line, latest_trend, conn, symbol_config
                         )
         except Exception as e:
             logger.error(f"Order WebSocket error: {str(e)}")
