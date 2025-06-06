@@ -25,7 +25,7 @@ from okx.PublicData import PublicAPI
 init()
 
 # Script Version
-SCRIPT_VERSION = "2.0.8" #123
+SCRIPT_VERSION = "2.0.10" #123
 
 # Set up logging with dual handlers
 logger = logging.getLogger(__name__)
@@ -264,7 +264,7 @@ def init_db():
     if okx_position:
         current_position = okx_position
         current_position['position_id'] = str(uuid.uuid4())
-        logger.info(f"Synced position from OKX: Side: {current_position['side']}, Entry Price: {current_position['entry_price']:.2f}")
+        logger.info(f"Synced position from OKX: Side: {current_position['side']}, Entry Price: {current_position['entry_price']:.2f}, Size: {current_position['size']} XRP")
         c.execute('''INSERT INTO trades (timestamp, trading_pair, timeframe, side, entry_price, size, stop_loss, stop_loss_order_id, order_id, position_id)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                   (current_position['open_time'], TRADING_PAIR, TIMEFRAME, current_position['side'],
@@ -272,16 +272,17 @@ def init_db():
                    current_position.get('stop_loss_order_id'), current_position.get('order_id'), current_position['position_id']))
         # Set stop-loss if none exists
         stop_loss = latest_st_line - STOP_LOSS_OFFSET if latest_trend == 1 else latest_st_line + STOP_LOSS_OFFSET
-        stop_loss_order_id = update_stop_loss(
-            okx_trade_api, OKX_TRADING_PAIR, current_position['side'],
-            adjust_price(stop_loss, symbol_config), None,
-            current_position['entry_price'], current_position['size'], okx_public_api, is_new_position=True)
-        if stop_loss_order_id:
-            logger.info(f"Placed stop-loss order ID: {stop_loss_order_id} at {stop_loss}")
-            current_position['stop_loss'] = stop_loss
-            current_position['stop_loss_order_id'] = stop_loss_order_id
-            c.execute("UPDATE trades SET stop_loss = ?, stop_loss_order_id = ? WHERE position_id = ?",
-                      (stop_loss, stop_loss_order_id, current_position['position_id']))
+        if stop_loss:
+            stop_loss_order_id = update_stop_loss(
+                okx_trade_api, OKX_TRADING_PAIR, current_position['side'],
+                adjust_price(stop_loss, symbol_config), None,
+                current_position['entry_price'], current_position['size'], okx_public_api, is_new_position=True)
+            if stop_loss_order_id:
+                logger.info(f"Placed stop-loss order ID: {stop_loss_order_id} at {stop_loss}")
+                current_position['stop_loss'] = stop_loss
+                current_position['stop_loss_order_id'] = stop_loss_order_id
+                c.execute("UPDATE trades SET stop_loss = ?, stop_loss_order_id = ? WHERE position_id = ?",
+                          (stop_loss, stop_loss_order_id, current_position['position_id']))
         conn.commit()
     else:
         current_position = None
@@ -309,31 +310,40 @@ def init_db():
         if pending_orders:
             logger.info(f"Recovered {len(pending_orders)} pending orders from OKX")
 
-    # Sync filled orders for open position only
+    # Sync filled orders only for open position
     if current_position:
+        start_timestamp = int(datetime.fromisoformat(start_time.replace('+00:00', 'Z')).timestamp() * 1000)
         orders = okx_trade_api.get_orders_history(instType="SWAP", instId=OKX_TRADING_PAIR, ordType="limit", limit=100)
         if orders['code'] == "0":
             for order in orders['data']:
-                if order['state'] == 'filled' and order['uTime'] >= int(datetime.fromisoformat(start_time.replace('+00:00', 'Z')).timestamp() * 1000):
-                    c.execute("SELECT * FROM orders WHERE order_id = ?", (order['ordId'],))
-                    if not c.fetchone():
-                        position_id = current_position['position_id'] if order['side'] == ('buy' if current_position['side'] == 'LONG' else 'sell') else None
-                        if position_id:
-                            c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id, run_id)
-                                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                                      (1, order['ordId'], order['side'], float(order['avgPx']), float(order['accFillSz']) * symbol_config['contractSize'],
-                                       'filled', str(datetime.now(timezone.utc)), position_id, run_id))
-                            fill_data = {
-                                'order_id': order['ordId'],
-                                'symbol': order['instId'],
-                                'side': order['side'],
-                                'price': float(order['avgPx']),
-                                'size': float(order['accFillSz']) * symbol_config['contractSize'],
-                                'position_id': position_id
-                            }
-                            redis_client.rpush(f"bot_{BOT_INSTANCE_ID}_fill_queue", json.dumps(fill_data))
-                            logger.info(f"Synced filled order from history: {fill_data}")
+                try:
+                    order_utime = int(order['uTime']) if order['uTime'] else 0
+                    logger.debug(f"Checking order {order['ordId']}: uTime={order_utime}, start_timestamp={start_timestamp}")
+                    if order['state'] == 'filled' and order_utime >= start_timestamp:
+                        c.execute("SELECT * FROM orders WHERE order_id = ?", (order['ordId'],))
+                        if not c.fetchone():
+                            position_id = current_position['position_id'] if order['side'] == ('buy' if current_position['side'] == 'LONG' else 'sell') else None
+                            if position_id:
+                                c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id, run_id)
+                                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                                          (1, order['ordId'], order['side'], float(order['avgPx']), float(order['accFillSz']) * symbol_config['contractSize'],
+                                           'filled', str(datetime.now(timezone.utc)), position_id, run_id))
+                                fill_data = {
+                                    'order_id': order['ordId'],
+                                    'symbol': order['instId'],
+                                    'side': order['side'],
+                                    'price': float(order['avgPx']),
+                                    'size': float(order['accFillSz']) * symbol_config['contractSize'],
+                                    'position_id': position_id
+                                }
+                                redis_client.rpush(f"bot_{BOT_INSTANCE_ID}_fill_queue", json.dumps(fill_data))
+                                logger.info(f"Synced filled order from history: {fill_data}")
+                except (ValueError, KeyError) as e:
+                    logger.error(f"Failed to process order {order.get('ordId', 'unknown')}: {str(e)}")
+                    log_error(str(e), "init_db_order_sync")
             conn.commit()
+    else:
+        logger.info("No open position, skipping historical order sync")
     conn.close()
     return conn
 
@@ -907,6 +917,7 @@ def process_fill_events(symbol_config):
                         'order_id': fill_data['order_id'],
                         'position_id': position_id
                     }
+                    logger.info(f"Opened new position: {current_position['side']} at {current_position['entry_price']:.4f}, Size: {current_position['size']} XRP, Position ID: {position_id}")
                     c.execute('''INSERT INTO trades (timestamp, trading_pair, timeframe, side, entry_price, size, order_id, position_id)
                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
                               (str(datetime.now(timezone.utc)), TRADING_PAIR, TIMEFRAME, current_position['side'],
@@ -914,25 +925,28 @@ def process_fill_events(symbol_config):
                     c.execute("UPDATE orders SET position_id = ? WHERE status = 'pending' AND side = ? AND position_id IS NULL",
                               (position_id, fill_data['side']))
                 else:
+                    old_size = current_position['size']
                     current_position['size'] += fill_data['size']
                     current_position['entry_price'] = (
-                        (current_position['entry_price'] * current_position['size'] + fill_data['price'] * fill_data['size']) /
-                        (current_position['size'] + fill_data['size'])
+                        (current_position['entry_price'] * old_size + fill_data['price'] * fill_data['size']) /
+                        current_position['size']
                     )
+                    logger.info(f"Updated position: {current_position['side']} at {current_position['entry_price']:.4f}, Size: {current_position['size']} XRP")
                     c.execute("UPDATE trades SET size = ?, entry_price = ? WHERE position_id = ? AND exit_price IS NULL",
                               (current_position['size'], current_position['entry_price'], current_position['position_id']))
                 place_tp_orders(fill_data, conn, symbol_config)
                 stop_loss = latest_st_line - STOP_LOSS_OFFSET if latest_trend == 1 else latest_st_line + STOP_LOSS_OFFSET
-                stop_loss_order_id = update_stop_loss(
-                    okx_trade_api, OKX_TRADING_PAIR, current_position['side'],
-                    adjust_price(stop_loss, symbol_config), current_position.get('stop_loss_order_id'),
-                    fill_data['price'], current_position['size'], okx_public_api)
-                if stop_loss_order_id:
-                    logger.info(f"Placed stop-loss order ID: {stop_loss_order_id} at {stop_loss}")
-                    current_position['stop_loss'] = stop_loss
-                    current_position['stop_loss_order_id'] = stop_loss_order_id
-                    c.execute("UPDATE trades SET stop_loss = ?, stop_loss_order_id = ? WHERE position_id = ?",
-                              (stop_loss, stop_loss_order_id, current_position['position_id']))
+                if stop_loss:
+                    stop_loss_order_id = update_stop_loss(
+                        okx_trade_api, OKX_TRADING_PAIR, current_position['side'],
+                        adjust_price(stop_loss, symbol_config), current_position.get('stop_loss_order_id'),
+                        fill_data['price'], current_position['size'], okx_public_api)
+                    if stop_loss_order_id:
+                        logger.info(f"Placed stop-loss order ID: {stop_loss_order_id} at {stop_loss}")
+                        current_position['stop_loss'] = stop_loss
+                        current_position['stop_loss_order_id'] = stop_loss_order_id
+                        c.execute("UPDATE trades SET stop_loss = ?, stop_loss_order_id = ? WHERE position_id = ?",
+                                  (stop_loss, stop_loss_order_id, current_position['position_id']))
             conn.commit()
             conn.close()
         except Exception as e:
