@@ -344,8 +344,7 @@ def init_db():
             conn.commit()
     else:
         logger.info("No open position, skipping historical order sync")
-    conn.close()
-    return conn
+    return conn  # Return open connection
 
 
 # Log error to database
@@ -603,86 +602,94 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
     min_range, max_range = ORDERS_RANGE[1] / 100, ORDERS_RANGE[0] / 100
     base_size = POSITION_SIZE / ORDERS_PER_TRADE
 
-    c = conn.cursor()
-    c.execute("SELECT id FROM bot_runs ORDER BY id DESC LIMIT 1")
-    run_id = c.fetchone()[0]
-
     try:
-        orders = okx_trade_api.get_order_list(instType="SWAP", instId=OKX_TRADING_PAIR, ordType="limit")
-        if orders['code'] == "0":
-            for order in orders['data']:
-                if order['state'] in ['live', 'partially_filled']:
-                    okx_trade_api.cancel_order(instId=OKX_TRADING_PAIR, ordId=order['ordId'])
-                    logger.debug(f"Canceled existing order ID: {order['ordId']}")
-    except Exception as e:
-        logger.error(f"Failed to cancel existing orders: {str(e)}")
-        log_error(str(e), "place_limit_orders")
+        db_conn = sqlite3.connect('trade_history_v2.db', timeout=10)
+        c = db_conn.cursor()
+        c.execute("SELECT id FROM bot_runs ORDER BY id DESC LIMIT 1")
+        run_id = c.fetchone()[0]
 
-    c.execute("UPDATE orders SET status = 'cancelled' WHERE status = 'pending'")
-    pending_orders = []
+        try:
+            orders = okx_trade_api.get_order_list(instType="SWAP", instId=OKX_TRADING_PAIR, ordType="limit")
+            if orders['code'] == "0":
+                for order in orders['data']:
+                    if order['state'] in ['live', 'partially_filled']:
+                        okx_trade_api.cancel_order(instId=OKX_TRADING_PAIR, ordId=order['ordId'])
+                        logger.debug(f"Canceled existing order ID: {order['ordId']}")
+        except Exception as e:
+            logger.error(f"Failed to cancel existing orders: {str(e)}")
+            log_error(str(e), "place_limit_orders")
 
-    if trend == 1:
-        base_price = st_line * (1 + min_range)
-        price_range = st_line * (max_range - min_range)
-        side = 'buy'
-    else:
-        base_price = st_line * (1 - max_range)
-        price_range = st_line * (max_range - min_range)
-        side = 'sell'
+        c.execute("UPDATE orders SET status = 'cancelled' WHERE status = 'pending'")
+        pending_orders = []
 
-    orders = []
-    for i in range(ORDERS_PER_TRADE):
-        price = base_price + (i / (ORDERS_PER_TRADE - 1)) * price_range if ORDERS_PER_TRADE > 1 else base_price
-        size = base_size * (1 + random.uniform(-0.1, 0.1))
-        price = adjust_price(price, symbol_config)
-        size = adjust_quantity(size, symbol_config, price)
-        logger.debug(f"Preparing order: {side} at {price} with size {size} XRP")
-        orders.append({
-            'instId': OKX_TRADING_PAIR,
-            'tdMode': 'isolated',
-            'side': side,
-            'ordType': 'limit',
-            'px': str(price),
-            'sz': str(size / symbol_config['contractSize'])
-        })
-        pending_orders.append({'price': price, 'size': size, 'side': side, 'position_id': None})
+        if trend == 1:
+            base_price = st_line * (1 + min_range)
+            price_range = st_line * (max_range - min_range)
+            side = 'buy'
+        else:
+            base_price = st_line * (1 - max_range)
+            price_range = st_line * (max_range - min_range)
+            side = 'sell'
 
-    batch_result = okx_trade_api.place_multiple_orders(orders)
-    placed_count = 0
-    if batch_result['code'] != "0":
-        logger.error(f"Failed to place limit orders: {batch_result['msg']}")
-        log_error(f"Failed to place limit orders: {batch_result['msg']}", "place_limit_orders")
-        for order_data in batch_result['data']:
-            if order_data['sCode'] != "0":
-                logger.warning(f"Order failed: {order_data['sMsg']} (Price: {order_data.get('px')}, Size: {order_data.get('sz')})")
-            elif order_data['sCode'] == "0":
+        orders = []
+        for i in range(ORDERS_PER_TRADE):
+            price = base_price + (i / (ORDERS_PER_TRADE - 1)) * price_range if ORDERS_PER_TRADE > 1 else base_price
+            size = base_size * (1 + random.uniform(-0.1, 0.1))
+            price = adjust_price(price, symbol_config)
+            size = adjust_quantity(size, symbol_config, price)
+            logger.debug(f"Preparing order: {side} at {price} with size {size} XRP")
+            orders.append({
+                'instId': OKX_TRADING_PAIR,
+                'tdMode': 'isolated',
+                'side': side,
+                'ordType': 'limit',
+                'px': str(price),
+                'sz': str(size / symbol_config['contractSize'])
+            })
+            pending_orders.append({'price': price, 'size': size, 'side': side, 'position_id': None})
+
+        batch_result = okx_trade_api.place_multiple_orders(orders)
+        placed_count = 0
+        if batch_result['code'] != "0":
+            logger.error(f"Failed to place limit orders: {batch_result['msg']}")
+            log_error(f"Failed to place limit orders: {batch_result['msg']}", "place_limit_orders")
+            for order_data in batch_result['data']:
+                if order_data['sCode'] != "0":
+                    logger.warning(f"Order failed: {order_data['sMsg']} (Price: {order_data.get('px')}, Size: {order_data.get('sz')})")
+                elif order_data['sCode'] == "0":
+                    order_id = order_data['ordId']
+                    c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id, run_id)
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                              (1, order_id, side, float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'],
+                               'pending', str(datetime.now(timezone.utc)), None, run_id))
+                    placed_count += 1
+            if placed_count == 0:
+                pending_orders = []
+                c.execute("DELETE FROM orders WHERE status = 'pending'")
+            db_conn.commit()
+            logger.info(f"Placed {placed_count} limit orders for trend {trend}")
+            return
+
+        c = db_conn.cursor()
+        for order_data, order in zip(batch_result['data'], orders):
+            if order_data['sCode'] == "0":
                 order_id = order_data['ordId']
                 c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id, run_id)
                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                          (1, order_id, side, float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'],
+                          (1, order_id, order['side'], float(order['px']), float(order['sz']) * symbol_config['contractSize'],
                            'pending', str(datetime.now(timezone.utc)), None, run_id))
                 placed_count += 1
-        if placed_count == 0:
-            pending_orders = []
-            c.execute("DELETE FROM orders WHERE status = 'pending'")
-        conn.commit()
+            else:
+                logger.warning(f"Order failed: {order_data['sMsg']} (Price: {order_data.get('px')}, Size: {order_data.get('sz')})")
+                pending_orders = [o for o in pending_orders if o['price'] != float(order_data.get('px', 0))]
+        db_conn.commit()
         logger.info(f"Placed {placed_count} limit orders for trend {trend}")
-        return
-
-    c = conn.cursor()
-    for order_data, order in zip(batch_result['data'], orders):
-        if order_data['sCode'] == "0":
-            order_id = order_data['ordId']
-            c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id, run_id)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                      (1, order_id, order['side'], float(order['px']), float(order['sz']) * symbol_config['contractSize'],
-                       'pending', str(datetime.now(timezone.utc)), None, run_id))
-            placed_count += 1
-        else:
-            logger.warning(f"Order failed: {order_data['sMsg']} (Price: {order_data.get('px')}, Size: {order_data.get('sz')})")
-            pending_orders = [o for o in pending_orders if o['price'] != float(order_data.get('px', 0))]
-    conn.commit()
-    logger.info(f"Placed {placed_count} limit orders for trend {trend}")
+    except Exception as e:
+        logger.error(f"Error in place_limit_orders: {str(e)}")
+        log_error(str(e), "place_limit_orders")
+    finally:
+        if 'db_conn' in locals():
+            db_conn.close()
 
 
 # Place take-profit orders
@@ -1068,132 +1075,135 @@ def on_open(ws):
 
 def on_message(ws, message):
     """Handle WebSocket messages for candles."""
-    global kline_data, previous_st_line, previous_trend, current_position, conn, latest_st_line, latest_trend, historical_data_fetched
+    global kline_data, previous_st_line, previous_trend, current_position, conn, latest_st_line, latest_trend, historical_data_fetched, first_closed_candle
     try:
         data = json.loads(message)
-        if 'data' in data and 'k' in data['data']:
-            kline = data['data']['k']
-            new_row = pd.DataFrame({
-                'timestamp': [pd.to_datetime(int(kline['t']), unit='ms')],
-                'open': [float(kline['o'])],
-                'high': [float(kline['h'])],
-                'low': [float(kline['l'])],
-                'close': [float(kline['c'])],
-                'volume': [float(kline['v'])]
-            })
+        if 'data' not in data or 'k' not in data['data']:
+            logger.debug(f"Non-kline WebSocket message: {message}")
+            return
+        kline = data['data']['k']
+        new_row = pd.DataFrame({
+            'timestamp': [pd.to_datetime(int(kline['t']), unit='ms')],
+            'open': [float(kline['o'])],
+            'high': [float(kline['h'])],
+            'low': [float(kline['l'])],
+            'close': [float(kline['c'])],
+            'volume': [float(kline['v'])]
+        })
 
-            if not kline_data.empty and kline_data['timestamp'].iloc[-1] == new_row['timestamp'].iloc[0]:
-                kline_data.iloc[-1] = new_row.iloc[0]
-            else:
-                kline_data = pd.concat([kline_data, new_row], ignore_index=True)
-            kline_data = kline_data.tail(2000)
+        if not kline_data.empty and kline_data['timestamp'].iloc[-1] == new_row['timestamp'].iloc[0]:
+            kline_data.iloc[-1] = new_row.iloc[0]
+        else:
+            kline_data = pd.concat([kline_data, new_row], ignore_index=True)
+        kline_data = kline_data.tail(2000)
 
-            if kline['x']:
-                if not historical_data_fetched:
-                    logger.info("Fetching historical data for first closed candle")
-                    fetch_historical_data(limit=1000, end_time=int(kline['t']) - 1, num_batches=2)
-                    if len(kline_data) < ATR_PERIOD:
-                        logger.warning(f"{Fore.YELLOW}Insufficient data after fetch: {len(kline_data)} candles, need {ATR_PERIOD}{Style.RESET_ALL}")
-                        return
-
+        if kline['x']:
+            if not historical_data_fetched:
+                logger.info("Fetching historical data for first closed candle")
+                fetch_historical_data(limit=1000, end_time=int(kline['t']) - 1, num_batches=2)
                 if len(kline_data) < ATR_PERIOD:
-                    logger.warning(f"{Fore.YELLOW}Insufficient data: {len(kline_data)} candles, need {ATR_PERIOD}{Style.RESET_ALL}")
+                    logger.warning(f"{Fore.YELLOW}Insufficient data after fetch: {len(kline_data)} candles, need {ATR_PERIOD}{Style.RESET_ALL}")
                     return
 
-                df = kline_data.copy()
-                df.set_index('timestamp', inplace=True)
+            if len(kline_data) < ATR_PERIOD:
+                logger.warning(f"{Fore.YELLOW}Insufficient data: {len(kline_data)} candles, need {ATR_PERIOD}{Style.RESET_ALL}")
+                return
 
-                line_st, trend = calculate_supertrend(df, ATR_PERIOD, ATR_RATIO)
-                latest_st_line = line_st.iloc[-1]
-                latest_trend = trend.iloc[-1]
-                latest_close = df['close'].iloc[-1]
+            df = kline_data.copy()
+            df.set_index('timestamp', inplace=True)
 
-                logger.info(f"Close: {latest_close:.10f}, ST_LINE: {latest_st_line:.10f}, Trend: {latest_trend}")
+            line_st, trend = calculate_supertrend(df, ATR_PERIOD, ATR_RATIO)
+            latest_st_line = line_st.iloc[-1]
+            latest_trend = trend.iloc[-1]
+            latest_close = df['close'].iloc[-1]
 
-                if previous_trend is not None and latest_trend != previous_trend:
-                    logger.info(f"Trend flipped from {previous_trend} to {latest_trend}")
+            logger.info(f"Close: {latest_close:.10f}, ST_LINE: {latest_st_line:.10f}, Trend: {latest_trend}")
 
-                symbol_config = load_symbol_config(OKX_TRADING_PAIR, okx_public_api)
-                stop_loss = latest_st_line - STOP_LOSS_OFFSET if latest_trend == 1 else latest_st_line + STOP_LOSS_OFFSET
+            if previous_trend is not None and latest_trend != previous_trend:
+                logger.info(f"Trend flipped from {previous_trend} to {latest_trend}")
 
-                # Place orders on first candle or if conditions met
-                st_line_shift = abs((latest_st_line - previous_st_line) / previous_st_line) if previous_st_line else 0
-                logger.debug(f"Order placement check: first_candle={previous_trend is None}, trend_changed={previous_trend != latest_trend}, st_line_shift={st_line_shift:.4%}")
-                if previous_trend is None or previous_trend != latest_trend or st_line_shift > ST_LINE_SHIFT_THRESHOLD:
-                    logger.info(f"Placing limit orders: Trend={latest_trend}, ST_LINE={latest_st_line:.2f}")
-                    place_limit_orders(latest_trend, latest_st_line, conn, symbol_config)
+            symbol_config = load_symbol_config(OKX_TRADING_PAIR, okx_public_api)
+            stop_loss = latest_st_line - STOP_LOSS_OFFSET if latest_trend == 1 else latest_st_line + STOP_LOSS_OFFSET
 
-                if current_position:
-                    okx_position = sync_position_with_okx(okx_account_api, okx_trade_api, OKX_TRADING_PAIR)
-                    if okx_position:
-                        current_position['stop_loss'] = okx_position.get('stop_loss')
-                        current_position['stop_loss_order_id'] = okx_position.get('stop_loss_order_id')
-                    stop_loss_order_id = update_stop_loss(
-                        okx_trade_api, OKX_TRADING_PAIR, current_position['side'],
-                        adjust_price(stop_loss, symbol_config), current_position.get('stop_loss_order_id'),
-                        latest_close, current_position['size'], okx_public_api)
-                    if stop_loss_order_id:
-                        current_position['stop_loss'] = stop_loss
-                        current_position['stop_loss_order_id'] = stop_loss_order_id
-                        c = conn.cursor()
-                        c.execute("UPDATE trades SET stop_loss = ?, stop_loss_order_id = ? WHERE order_id = ? AND exit_price IS NULL",
-                                  (stop_loss, stop_loss_order_id, current_position['order_id']))
-                        conn.commit()
-                    if (current_position['side'] == 'LONG' and latest_close <= current_position['stop_loss']) or \
-                       (current_position['side'] == 'SHORT' and latest_close >= current_position['stop_loss']):
-                        cancel_all_stop_loss_orders(okx_trade_api, OKX_TRADING_PAIR)
-                        close_result = okx_trade_api.close_positions(
+            st_line_shift = abs((latest_st_line - previous_st_line) / previous_st_line) if previous_st_line else 0
+            logger.debug(f"Order placement check: first_candle={first_closed_candle}, trend_changed={previous_trend != latest_trend}, st_line_shift={st_line_shift:.4%}, has_position={bool(current_position)}, has_orders={bool(pending_orders)}")
+            if (first_closed_candle and not current_position and not pending_orders) or (previous_trend != latest_trend or st_line_shift > ST_LINE_SHIFT_THRESHOLD):
+                logger.info(f"Placing limit orders: Trend={latest_trend}, ST_LINE={latest_st_line:.2f}")
+                place_limit_orders(latest_trend, latest_st_line, conn, symbol_config)
+
+            if current_position:
+                okx_position = sync_position_with_okx(okx_account_api, okx_trade_api, OKX_TRADING_PAIR)
+                if okx_position:
+                    current_position['stop_loss'] = okx_position.get('stop_loss')
+                    current_position['stop_loss_order_id'] = okx_position.get('stop_loss_order_id')
+                stop_loss_order_id = update_stop_loss(
+                    okx_trade_api, OKX_TRADING_PAIR, current_position['side'],
+                    adjust_price(stop_loss, symbol_config), current_position.get('stop_loss_order_id'),
+                    latest_close, current_position['size'], okx_public_api)
+                if stop_loss_order_id:
+                    current_position['stop_loss'] = stop_loss
+                    current_position['stop_loss_order_id'] = stop_loss_order_id
+                    c = conn.cursor()
+                    c.execute("UPDATE trades SET stop_loss = ?, stop_loss_order_id = ? WHERE position_id = ?",
+                              (stop_loss, stop_loss_order_id, current_position['position_id']))
+                    conn.commit()
+                if (current_position['side'] == 'LONG' and latest_close <= current_position['stop_loss']) or \
+                   (current_position['side'] == 'SHORT' and latest_close >= current_position['stop_loss']):
+                    cancel_all_stop_loss_orders(okx_trade_api, OKX_TRADING_PAIR)
+                    close_result = okx_trade_api.close_positions(
+                        instId=OKX_TRADING_PAIR,
+                        mgnMode="isolated",
+                        posSide="net"
+                    )
+                    if close_result['code'] != "0":
+                        close_quantity = adjust_quantity(current_position['size'], symbol_config, latest_close)
+                        close_side = 'sell' if current_position['side'] == 'LONG' else 'buy'
+                        close_result = okx_trade_api.place_order(
                             instId=OKX_TRADING_PAIR,
-                            mgnMode="isolated",
-                            posSide="net"
+                            tdMode="isolated",
+                            side=close_side,
+                            ordType="market",
+                            sz=str(close_quantity / symbol_config['contractSize']),
+                            reduceOnly="true"
                         )
                         if close_result['code'] != "0":
-                            close_quantity = adjust_quantity(current_position['size'], symbol_config, latest_close)
-                            close_side = 'sell' if current_position['side'] == 'LONG' else 'buy'
-                            close_result = okx_trade_api.place_order(
-                                instId=OKX_TRADING_PAIR,
-                                tdMode="isolated",
-                                side=close_side,
-                                ordType="market",
-                                sz=str(close_quantity),
-                                reduceOnly="true"
-                            )
-                            if close_result['code'] != "0":
-                                logger.error(f"Failed to close position: {close_result['msg']}")
-                                log_error(conn, close_result['msg'], "stop_loss_trigger")
-                                raise Exception(f"Failed to close position")
-                        ord_id = close_result['data'][0].get('ordId', 'unknown') if close_result['code'] == "0" and 'data' in close_result else 'unknown'
-                        trade = {
-                            'timestamp': str(datetime.now(timezone.utc)),
-                            'trading_pair': TRADING_PAIR,
-                            'timeframe': TIMEFRAME,
-                            'side': current_position['side'],
-                            'entry_price': current_position['entry_price'],
-                            'size': current_position['size'],
-                            'exit_price': latest_close,
-                            'stop_loss': current_position.get('stop_loss'),
-                            'profit_loss': (latest_close - current_position['entry_price']) * current_position['size'] if current_position['side'] == 'LONG' else (current_position['entry_price'] - latest_close) * current_position['size'],
-                            'trend': latest_trend,
-                            'order_id': ord_id,
-                            'stop_loss_order_id': current_position.get('stop_loss_order_id')
-                        }
-                        trade_history.append(trade)
-                        c = conn.cursor()
-                        c.execute('''INSERT INTO trades (timestamp, trading_pair, timeframe, side, entry_price, size, exit_price, stop_loss, profit_loss, trend, order_id, stop_loss_order_id)
-                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                                  (trade['timestamp'], trade['trading_pair'], trade['timeframe'], trade['side'],
-                                   trade['entry_price'], trade['size'], trade['exit_price'], trade['stop_loss'],
-                                   trade['profit_loss'], trade['trend'], trade['order_id'], trade['stop_loss_order_id']))
-                        conn.commit()
-                        logger.info(f"Stop-loss triggered: Closed {trade['side']} at {latest_close:.2f}, P/L: {trade['profit_loss']:.2f} USDT")
-                        current_position = None
+                            logger.error(f"Failed to close position: {close_result['msg']}")
+                            log_error(f"Failed to close position: {close_result['msg']}", "stop_loss_trigger")
+                            raise Exception(f"Failed to close position")
+                    ord_id = close_result['data'][0].get('ordId', 'unknown') if close_result['code'] == "0" and 'data' in close_result else 'unknown'
+                    trade = {
+                        'timestamp': str(datetime.now(timezone.utc)),
+                        'trading_pair': TRADING_PAIR,
+                        'timeframe': TIMEFRAME,
+                        'side': current_position['side'],
+                        'entry_price': current_position['entry_price'],
+                        'size': current_position['size'],
+                        'exit_price': latest_close,
+                        'stop_loss': current_position.get('stop_loss'),
+                        'profit_loss': (latest_close - current_position['entry_price']) * current_position['size'] if current_position['side'] == 'LONG' else (current_position['entry_price'] - latest_close) * current_position['size'],
+                        'trend': latest_trend,
+                        'order_id': ord_id,
+                        'stop_loss_order_id': current_position.get('stop_loss_order_id'),
+                        'position_id': current_position['position_id']
+                    }
+                    trade_history.append(trade)
+                    c = conn.cursor()
+                    c.execute('''INSERT INTO trades (timestamp, trading_pair, timeframe, side, entry_price, size, exit_price, stop_loss, profit_loss, trend, order_id, stop_loss_order_id, position_id)
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                              (trade['timestamp'], trade['trading_pair'], trade['timeframe'], trade['side'],
+                               trade['entry_price'], trade['size'], trade['exit_price'], trade['stop_loss'],
+                               trade['profit_loss'], trade['trend'], trade['order_id'], trade['stop_loss_order_id'], trade['position_id']))
+                    conn.commit()
+                    logger.info(f"Stop-loss triggered: Closed {trade['side']} at {latest_close:.2f}, P/L: {trade['profit_loss']:.2f} USDT")
+                    current_position = None
 
-                previous_st_line = latest_st_line
-                previous_trend = latest_trend
+            first_closed_candle = False
+            previous_st_line = latest_st_line
+            previous_trend = latest_trend
 
     except Exception as e:
-        logger.error(f"{Fore.RED}Candle WebSocket error: {str(e)}{Style.RESET_ALL}")
-        log_error(conn, str(e), "on_message")
+        logger.error(f"{Fore.RED}Candle WebSocket error: {str(e)} (Message: {message}){Style.RESET_ALL}")
+        log_error(f"Candle WebSocket error: {str(e)}", "on_message")
 
 
 def on_error(ws, error):
@@ -1251,7 +1261,6 @@ def main():
     try:
         ws.run_forever()
     finally:
-        conn = sqlite3.connect('trade_history_v2.db', timeout=10)
         c = conn.cursor()
         c.execute("UPDATE bot_runs SET end_time = ? WHERE end_time IS NULL", (str(datetime.now(timezone.utc)),))
         conn.commit()
