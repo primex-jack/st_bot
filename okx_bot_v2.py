@@ -25,7 +25,7 @@ from okx.PublicData import PublicAPI
 init()
 
 # Script Version
-SCRIPT_VERSION = "2.0.12" #123
+SCRIPT_VERSION = "2.0.13" #123
 
 # Set up logging with dual handlers
 logger = logging.getLogger(__name__)
@@ -383,45 +383,47 @@ def log_error(error_message, context):
 
 # Load or fetch symbol configuration
 def load_symbol_config(symbol, public_api):
-    """Load or fetch symbol configuration for OKX."""
-    symbol_configs = {}
-    if os.path.exists(SYMBOL_CONFIG_FILE):
-        with open(SYMBOL_CONFIG_FILE, 'r') as f:
-            symbol_configs = json.load(f)
-        for sym in symbol_configs:
-            if 'contractSize' not in symbol_configs[sym]:
-                symbol_configs[sym]['contractSize'] = 0.01
-                logger.debug(f"Added contractSize to existing config for {sym}")
-            if 'lotSize' not in symbol_configs[sym]:
-                symbol_configs[sym]['lotSize'] = 1.0
-                logger.debug(f"Added lotSize to existing config for {sym}")
-        with open(SYMBOL_CONFIG_FILE, 'w') as f:
-            json.dump(symbol_configs, f, indent=4)
+    """Load symbol configuration from JSON or OKX API."""
+    try:
+        with open('symbol_configs.json', 'r') as f:
+            content = f.read().strip()
+            if not content:
+                logger.error("symbol_configs.json is empty")
+                raise ValueError("symbol_configs.json is empty")
+            symbol_configs = json.loads(content)
+            if symbol not in symbol_configs:
+                logger.warning(f"Symbol {symbol} not found in symbol_configs.json, fetching from OKX API")
+                return fetch_symbol_config_from_api(symbol, public_api)
+            return symbol_configs[symbol]
+    except FileNotFoundError:
+        logger.warning("symbol_configs.json not found, fetching from OKX API")
+        return fetch_symbol_config_from_api(symbol, public_api)
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in symbol_configs.json: {str(e)}")
+        raise ValueError(f"Invalid JSON in symbol_configs.json: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error loading symbol config: {str(e)}")
+        raise
 
-    if symbol not in symbol_configs:
-        try:
-            instruments = public_api.get_instruments(instType="SWAP", instId=symbol)
-            if instruments['code'] != "0":
-                raise Exception(f"Failed to fetch instrument info: {instruments['msg']}")
-            instrument = instruments['data'][0]
-            logger.debug(f"Instrument details for {symbol}: {instrument}")
-            symbol_configs[symbol] = {
-                'lotSize': float(instrument['lotSz']),
-                'quantityPrecision': len(str(float(instrument['lotSz'])).rstrip('0').split('.')[1]) if '.' in str(
-                    float(instrument['lotSz'])) else 0,
-                'pricePrecision': len(str(float(instrument['tickSz'])).split('.')[1]) if '.' in str(
-                    float(instrument['tickSz'])) else 0,
-                'minQty': float(instrument['minSz']),
-                'minNotional': float(instrument.get('minSz', 5.0)),
-                'contractSize': float(instrument['ctVal'])
-            }
-            with open(SYMBOL_CONFIG_FILE, 'w') as f:
-                json.dump(symbol_configs, f, indent=4)
-        except Exception as e:
-            logger.error(f"{Fore.RED}Failed to fetch symbol info for {symbol}: {str(e)}.{Style.RESET_ALL}")
-            symbol_configs[symbol] = {'quantityPrecision': 3, 'pricePrecision': 2, 'minQty': 0.001, 'minNotional': 5.0,
-                                      'contractSize': 0.01}
-    return symbol_configs[symbol]
+def fetch_symbol_config_from_api(symbol, public_api):
+    """Fetch symbol configuration from OKX API."""
+    try:
+        result = public_api.get_instruments(instType="SWAP", instId=symbol)
+        if result['code'] != "0" or not result['data']:
+            raise ValueError(f"Failed to fetch instrument data for {symbol}: {result['msg']}")
+        instrument = result['data'][0]
+        config = {
+            'contractSize': float(instrument['ctVal']),
+            'lotSize': float(instrument.get('lotSz', 1.0)),
+            'quantityPrecision': int(instrument.get('szPrec', 0)),
+            'minQty': float(instrument.get('minSz', 1.0)),
+            'minNotional': float(instrument.get('minNotional', 5.0))
+        }
+        logger.info(f"Fetched config for {symbol}: {config}")
+        return config
+    except Exception as e:
+        logger.error(f"Failed to fetch symbol config from API for {symbol}: {str(e)}")
+        raise
 
 
 # Adjust quantity to match OKX precision
