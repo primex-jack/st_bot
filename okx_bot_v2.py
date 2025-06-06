@@ -221,7 +221,8 @@ def init_db():
                     size REAL,
                     status TEXT,
                     timestamp TEXT,
-                    position_id TEXT
+                    position_id TEXT,
+                    run_id INTEGER
                  )''')
     c.execute('''CREATE TABLE IF NOT EXISTS take_profits (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -232,7 +233,8 @@ def init_db():
                     size REAL,
                     status TEXT,
                     timestamp TEXT,
-                    position_id TEXT
+                    position_id TEXT,
+                    run_id INTEGER
                  )''')
     c.execute('''CREATE TABLE IF NOT EXISTS errors (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -245,16 +247,19 @@ def init_db():
                     start_time TEXT,
                     end_time TEXT
                  )''')
-    c.execute("INSERT INTO bot_runs (start_time) VALUES (?)", (str(datetime.now(timezone.utc)),))
+    start_time = str(datetime.now(timezone.utc))
+    c.execute("INSERT INTO bot_runs (start_time) VALUES (?)", (start_time,))
+    run_id = c.lastrowid
     conn.commit()
 
-    # Clear stale orders not tied to open positions
-    c.execute("DELETE FROM orders")
+    # Clear stale orders
+    c.execute("DELETE FROM orders WHERE status = 'pending'")
     c.execute("DELETE FROM take_profits")
     c.execute("UPDATE trades SET exit_price = 0 WHERE exit_price IS NULL")
     conn.commit()
 
     # State recovery
+    symbol_config = load_symbol_config(OKX_TRADING_PAIR, okx_public_api)
     okx_position = sync_position_with_okx(okx_account_api, okx_trade_api, OKX_TRADING_PAIR)
     if okx_position:
         current_position = okx_position
@@ -266,13 +271,13 @@ def init_db():
                    current_position['entry_price'], current_position['size'], current_position.get('stop_loss'),
                    current_position.get('stop_loss_order_id'), current_position.get('order_id'), current_position['position_id']))
         # Set stop-loss if none exists
-        symbol_config = load_symbol_config(OKX_TRADING_PAIR, okx_public_api)
         stop_loss = latest_st_line - STOP_LOSS_OFFSET if latest_trend == 1 else latest_st_line + STOP_LOSS_OFFSET
         stop_loss_order_id = update_stop_loss(
             okx_trade_api, OKX_TRADING_PAIR, current_position['side'],
             adjust_price(stop_loss, symbol_config), None,
             current_position['entry_price'], current_position['size'], okx_public_api, is_new_position=True)
         if stop_loss_order_id:
+            logger.info(f"Placed stop-loss order ID: {stop_loss_order_id} at {stop_loss}")
             current_position['stop_loss'] = stop_loss
             current_position['stop_loss_order_id'] = stop_loss_order_id
             c.execute("UPDATE trades SET stop_loss = ?, stop_loss_order_id = ? WHERE position_id = ?",
@@ -289,39 +294,46 @@ def init_db():
         for order in orders['data']:
             if order['state'] in ['live', 'partially_filled']:
                 position_id = current_position['position_id'] if current_position and order['side'] == ('buy' if current_position['side'] == 'LONG' else 'sell') else None
-                c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id, run_id)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                           (1, order['ordId'], order['side'], float(order['px']), float(order['sz']) * symbol_config['contractSize'],
-                           'pending', str(datetime.now(timezone.utc)), position_id))
-                pending_orders.append({'order_id': order['ordId'], 'side': order['side'], 'price': float(order['px']), 'size': float(order['sz']) * symbol_config['contractSize'], 'position_id': position_id})
+                           'pending', str(datetime.now(timezone.utc)), position_id, run_id))
+                pending_orders.append({
+                    'order_id': order['ordId'],
+                    'side': order['side'],
+                    'price': float(order['px']),
+                    'size': float(order['sz']) * symbol_config['contractSize'],
+                    'position_id': position_id
+                })
         conn.commit()
         if pending_orders:
             logger.info(f"Recovered {len(pending_orders)} pending orders from OKX")
 
-    # Sync recent filled orders (last 24 hours)
-    start_time = str(datetime.now(timezone.utc) - timedelta(hours=24))
-    orders = okx_trade_api.get_orders_history(instType="SWAP", instId=OKX_TRADING_PAIR, ordType="limit", limit=100)
-    if orders['code'] == "0":
-        for order in orders['data']:
-            if order['state'] == 'filled' and order['uTime'] >= int(datetime.fromisoformat(start_time.replace('+00:00', 'Z')).timestamp() * 1000):
-                c.execute("SELECT * FROM orders WHERE order_id = ?", (order['ordId'],))
-                if not c.fetchone():
-                    position_id = current_position['position_id'] if current_position and order['side'] == ('buy' if current_position['side'] == 'LONG' else 'sell') else None
-                    c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id)
-                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                              (1, order['ordId'], order['side'], float(order['avgPx']), float(order['accFillSz']) * symbol_config['contractSize'],
-                               'filled', str(datetime.now(timezone.utc)), position_id))
-                    fill_data = {
-                        'order_id': order['ordId'],
-                        'symbol': order['instId'],
-                        'side': order['side'],
-                        'price': float(order['avgPx']),
-                        'size': float(order['accFillSz']) * symbol_config['contractSize'],
-                        'position_id': position_id
-                    }
-                    redis_client.rpush(f"bot_{BOT_INSTANCE_ID}_fill_queue", json.dumps(fill_data))
-                    logger.info(f"Synced filled order from history: {fill_data}")
-        conn.commit()
+    # Sync filled orders for open position only
+    if current_position:
+        orders = okx_trade_api.get_orders_history(instType="SWAP", instId=OKX_TRADING_PAIR, ordType="limit", limit=100)
+        if orders['code'] == "0":
+            for order in orders['data']:
+                if order['state'] == 'filled' and order['uTime'] >= int(datetime.fromisoformat(start_time.replace('+00:00', 'Z')).timestamp() * 1000):
+                    c.execute("SELECT * FROM orders WHERE order_id = ?", (order['ordId'],))
+                    if not c.fetchone():
+                        position_id = current_position['position_id'] if order['side'] == ('buy' if current_position['side'] == 'LONG' else 'sell') else None
+                        if position_id:
+                            c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id, run_id)
+                                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                                      (1, order['ordId'], order['side'], float(order['avgPx']), float(order['accFillSz']) * symbol_config['contractSize'],
+                                       'filled', str(datetime.now(timezone.utc)), position_id, run_id))
+                            fill_data = {
+                                'order_id': order['ordId'],
+                                'symbol': order['instId'],
+                                'side': order['side'],
+                                'price': float(order['avgPx']),
+                                'size': float(order['accFillSz']) * symbol_config['contractSize'],
+                                'position_id': position_id
+                            }
+                            redis_client.rpush(f"bot_{BOT_INSTANCE_ID}_fill_queue", json.dumps(fill_data))
+                            logger.info(f"Synced filled order from history: {fill_data}")
+            conn.commit()
     conn.close()
     return conn
 
@@ -581,6 +593,10 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
     min_range, max_range = ORDERS_RANGE[1] / 100, ORDERS_RANGE[0] / 100
     base_size = POSITION_SIZE / ORDERS_PER_TRADE
 
+    c = conn.cursor()
+    c.execute("SELECT id FROM bot_runs ORDER BY id DESC LIMIT 1")
+    run_id = c.fetchone()[0]
+
     try:
         orders = okx_trade_api.get_order_list(instType="SWAP", instId=OKX_TRADING_PAIR, ordType="limit")
         if orders['code'] == "0":
@@ -592,7 +608,6 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
         logger.error(f"Failed to cancel existing orders: {str(e)}")
         log_error(str(e), "place_limit_orders")
 
-    c = conn.cursor()
     c.execute("UPDATE orders SET status = 'cancelled' WHERE status = 'pending'")
     pending_orders = []
 
@@ -618,7 +633,7 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
             'side': side,
             'ordType': 'limit',
             'px': str(price),
-            'sz': str(size / symbol_config['contractSize'])  # Convert to contracts for OKX
+            'sz': str(size / symbol_config['contractSize'])
         })
         pending_orders.append({'price': price, 'size': size, 'side': side, 'position_id': None})
 
@@ -632,10 +647,10 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
                 logger.warning(f"Order failed: {order_data['sMsg']} (Price: {order_data.get('px')}, Size: {order_data.get('sz')})")
             elif order_data['sCode'] == "0":
                 order_id = order_data['ordId']
-                c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id, run_id)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                           (1, order_id, side, float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'],
-                           'pending', str(datetime.now(timezone.utc)), None))
+                           'pending', str(datetime.now(timezone.utc)), None, run_id))
                 placed_count += 1
         if placed_count == 0:
             pending_orders = []
@@ -648,10 +663,10 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
     for order_data, order in zip(batch_result['data'], orders):
         if order_data['sCode'] == "0":
             order_id = order_data['ordId']
-            c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+            c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id, run_id)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                       (1, order_id, order['side'], float(order['px']), float(order['sz']) * symbol_config['contractSize'],
-                       'pending', str(datetime.now(timezone.utc)), None))
+                       'pending', str(datetime.now(timezone.utc)), None, run_id))
             placed_count += 1
         else:
             logger.warning(f"Order failed: {order_data['sMsg']} (Price: {order_data.get('px')}, Size: {order_data.get('sz')})")
@@ -896,7 +911,6 @@ def process_fill_events(symbol_config):
                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
                               (str(datetime.now(timezone.utc)), TRADING_PAIR, TIMEFRAME, current_position['side'],
                                current_position['entry_price'], current_position['size'], current_position['order_id'], position_id))
-                    # Update pending orders with position_id
                     c.execute("UPDATE orders SET position_id = ? WHERE status = 'pending' AND side = ? AND position_id IS NULL",
                               (position_id, fill_data['side']))
                 else:
@@ -914,6 +928,7 @@ def process_fill_events(symbol_config):
                     adjust_price(stop_loss, symbol_config), current_position.get('stop_loss_order_id'),
                     fill_data['price'], current_position['size'], okx_public_api)
                 if stop_loss_order_id:
+                    logger.info(f"Placed stop-loss order ID: {stop_loss_order_id} at {stop_loss}")
                     current_position['stop_loss'] = stop_loss
                     current_position['stop_loss_order_id'] = stop_loss_order_id
                     c.execute("UPDATE trades SET stop_loss = ?, stop_loss_order_id = ? WHERE position_id = ?",
@@ -1219,8 +1234,14 @@ def main():
         on_close=on_close
     )
     logger.warning(f"{Fore.YELLOW}Starting LIVE trading on OKX Futures V2! {SCRIPT_VERSION}{Style.RESET_ALL}")
-    ws.run_forever()
-    conn.close()
+    try:
+        ws.run_forever()
+    finally:
+        conn = sqlite3.connect('trade_history_v2.db', timeout=10)
+        c = conn.cursor()
+        c.execute("UPDATE bot_runs SET end_time = ? WHERE end_time IS NULL", (str(datetime.now(timezone.utc)),))
+        conn.commit()
+        conn.close()
 
 
 if __name__ == "__main__":
