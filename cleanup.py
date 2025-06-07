@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from okxclient import TradeAPI
+from okx.Trade import TradeAPI
 import redis
 import argparse
 

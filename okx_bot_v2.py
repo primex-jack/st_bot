@@ -18,6 +18,7 @@ import threading
 import random
 import uuid
 import psutil
+import sys
 from okx.Trade import TradeAPI
 from okx.Account import AccountAPI
 from okx.PublicData import PublicAPI
@@ -26,7 +27,7 @@ from okx.PublicData import PublicAPI
 init()
 
 # Script Version
-SCRIPT_VERSION = "2.0.13" #123
+SCRIPT_VERSION = "2.0.15" #123
 
 # Set up logging with dual handlers
 logger = logging.getLogger(__name__)
@@ -365,10 +366,11 @@ def init_db():
 from tenacity import retry, wait_fixed, stop_after_attempt
 
 @retry(wait=wait_fixed(0.5), stop=stop_after_attempt(10))
+@retry(wait=wait_fixed(1), stop=stop_after_attempt(20))
 def log_error(error_message, context):
     """Log errors to the database in a thread-safe manner."""
     try:
-        conn = sqlite3.connect('trade_history_v2.db', timeout=20)
+        conn = sqlite3.connect('trade_history_v2.db', timeout=30)
         c = conn.cursor()
         c.execute('''INSERT INTO errors (timestamp, error_message, context)
                      VALUES (?, ?, ?)''',
@@ -426,7 +428,6 @@ def fetch_symbol_config_from_api(symbol, public_api):
         logger.error(f"Failed to fetch symbol config from API for {symbol}: {str(e)}")
         raise
 
-
 # Adjust quantity to match OKX precision
 def adjust_quantity(quantity, symbol_config, price):
     """Adjust quantity to match OKX precision and minimum size, return asset units."""
@@ -457,36 +458,12 @@ def adjust_quantity(quantity, symbol_config, price):
     logger.debug(f"Adjusted quantity: {adjusted} contracts = {final_asset_size:.4f} asset units")
     return final_asset_size
 
-
-# Adjust price to match OKX precision
-def adjust_quantity(quantity, symbol_config, price):
-    """Adjust quantity to match OKX precision and minimum size, return asset units."""
-    contract_size = symbol_config['contractSize']  # e.g., 0.01 for XRP
-    lot_size = symbol_config.get('lotSize', 1.0)
-    precision = symbol_config['quantityPrecision']
-    min_qty = symbol_config['minQty']
-    min_notional = symbol_config['minNotional']
-    min_qty_notional = max(min_qty, min_notional / price / contract_size)
-
-    asset_size = quantity  # Input in asset units, e.g., 100 XRP
-    logger.debug(f"Initial asset size: {asset_size:.4f} units")
-
-    contracts = asset_size / contract_size  # e.g., 100 / 0.01 = 10,000 contracts
-    logger.debug(f"Initial contracts: {contracts:.4f}")
-
-    lots = contracts / lot_size
-    rounded_lots = round(max(lots, min_qty_notional / lot_size))
-    adjusted_contracts = rounded_lots * lot_size
-    adjusted = round(adjusted_contracts, precision)
-
-    adjusted = round(adjusted / lot_size) * lot_size
-    if adjusted < min_qty:
-        adjusted = min_qty
-        logger.debug(f"Adjusted quantity increased to meet minQty: {adjusted} contracts")
-
-    final_asset_size = adjusted * contract_size
-    logger.debug(f"Adjusted quantity: {adjusted} contracts = {final_asset_size:.4f} asset units")
-    return final_asset_size
+def adjust_price(price, symbol_config):
+    """Adjust price to match OKX precision."""
+    precision = symbol_config.get('pricePrecision', 4)
+    adjusted = round(price, precision)
+    logger.debug(f"Adjusted price: {price:.8f} to {adjusted:.{precision}f}")
+    return adjusted
 
 
 # Sync position with OKX
