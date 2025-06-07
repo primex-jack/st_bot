@@ -9,10 +9,10 @@ import time
 import hmac
 import hashlib
 import base64
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from colorama import init, Fore, Style
 import os
-from tenacity import retry, wait_exponential, stop_after_attempt
+from tenacity import retry, wait_exponential, wait_fixed, stop_after_attempt
 import redis
 import threading
 import random
@@ -23,13 +23,13 @@ from okx.Trade import TradeAPI
 from okx.Account import AccountAPI
 from okx.PublicData import PublicAPI
 
-# Initialize colorama for colored terminal output
+# Initialize colorama
 init()
 
 # Script Version
-SCRIPT_VERSION = "2.0.15" #123
+SCRIPT_VERSION = "2.0.16"
 
-# Set up logging with dual handlers
+# Set up logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 logging.getLogger('').handlers = []
@@ -45,7 +45,7 @@ console_handler.setFormatter(console_formatter)
 logger.addHandler(console_handler)
 logger.propagate = False
 
-# Global DataFrame to store kline data
+# Global DataFrame for kline data
 kline_data = pd.DataFrame(
     columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'],
     dtype='float64'
@@ -60,13 +60,11 @@ previous_st_line = None
 previous_trend = None
 latest_st_line = None
 latest_trend = None
-historical_data_fetched = False  # New flag
-first_closed_candle = True  # New flag
+historical_data_fetched = False
+first_closed_candle = True
 
-
-# Load configuration from config.json
+# Load configuration
 def load_config():
-    """Load and parse configuration from config.json."""
     try:
         with open('config.json', 'r') as f:
             config = json.load(f)
@@ -76,20 +74,17 @@ def load_config():
             'okx_api_key': config.get('okx_api_key', ''),
             'okx_api_secret': config.get('okx_api_secret', ''),
             'okx_passphrase': config.get('okx_passphrase', ''),
-            'atr_period': config.get('atr_period', 65),
-            'atr_ratio': config.get('atr_ratio', 10.0),
-            'position_size': config.get('position_size', 10.0),
-            'trading_pair': config.get('trading_pair', 'BTCUSDT'),
-            'timeframe': config.get('timeframe', '5m'),
-            'stop_loss_offset': config.get('stop_loss_offset', 500.0),
-            'telegram_token': config.get('telegram_token', ''),
-            'telegram_chat_id': config.get('telegram_chat_id', ''),
-            'bot_instance_id': config.get('bot_instance_id', 'bot1'),
+            'atr_period': config.get('atr_period', 12),
+            'atr_ratio': config.get('atr_ratio', 16.0),
+            'position_size': config.get('position_size', 10.0),  # Reduced for testing
+            'trading_pair': config.get('trading_pair', 'XRPUSDT'),
+            'timeframe': config.get('timeframe', '1m'),
+            'stop_loss_offset': config.get('stop_loss_offset', 0.01),
             'orders_per_trade': config.get('orders_per_trade', 10),
-            'orders_range': config.get('orders_range', '3-0.5'),
-            'tp_levels': config.get('tp_levels', 3),
-            'tp_percentages': config.get('tp_percentages', '1,2,3'),
-            'st_line_shift_threshold': config.get('st_line_shift_threshold', 0.5)
+            'orders_range': config.get('orders_range', '1-0.1'),
+            'tp_levels': config.get('tp_levels', 5),
+            'tp_percentages': config.get('tp_percentages', '0.5,0.7,1,2,3'),
+            'st_line_shift_threshold': config.get('st_line_shift_threshold', 0.05)
         }
     except FileNotFoundError:
         logger.error(f"{Fore.RED}Config file 'config.json' not found. Using defaults.{Style.RESET_ALL}")
@@ -99,24 +94,20 @@ def load_config():
             'okx_api_key': '',
             'okx_api_secret': '',
             'okx_passphrase': '',
-            'atr_period': 65,
-            'atr_ratio': 10.0,
+            'atr_period': 12,
+            'atr_ratio': 16.0,
             'position_size': 10.0,
-            'trading_pair': 'BTCUSDT',
-            'timeframe': '5m',
-            'stop_loss_offset': 500.0,
-            'telegram_token': '',
-            'telegram_chat_id': '',
-            'bot_instance_id': 'bot1',
+            'trading_pair': 'XRPUSDT',
+            'timeframe': '1m',
+            'stop_loss_offset': 0.01,
             'orders_per_trade': 10,
-            'orders_range': '3-0.5',
-            'tp_levels': 3,
-            'tp_percentages': '1,2,3',
-            'st_line_shift_threshold': 0.5
+            'orders_range': '1-0.1',
+            'tp_levels': 5,
+            'tp_percentages': '0.5,0.7,1,2,3',
+            'st_line_shift_threshold': 0.05
         }
 
-
-# Write PID to file and log startup
+# Write PID to file
 with open('bot_v2.pid', 'w') as f:
     pid = os.getpid()
     f.write(str(pid))
@@ -139,17 +130,17 @@ STOP_LOSS_OFFSET = config['stop_loss_offset']
 ORDERS_PER_TRADE = config['orders_per_trade']
 ORDERS_RANGE = [float(x) for x in config['orders_range'].split('-')]
 TP_LEVELS = config['tp_levels']
-TP_PERCENTAGES = [float(x) for x in config['tp_percentages'].split(',')]
+TP_PERCENTAGES = config['tp_percentages']
 ST_LINE_SHIFT_THRESHOLD = config['st_line_shift_threshold'] / 100
-BOT_INSTANCE_ID = config['bot_instance_id']
+BOT_INSTANCE_ID = config.get('bot_instance_id', 'v2_bot1')
 
 # Initialize Redis client
 redis_client = redis.Redis(host='localhost', port=6379, db=0)
 
-# Initialize Binance client for kline fetching
+# Initialize Binance client
 binance_client = UMFutures(key=BINANCE_API_KEY, secret=BINANCE_API_SECRET, base_url="https://fapi.binance.com")
 
-# Initialize OKX clients for trading
+# Initialize OKX clients
 okx_trade_api = TradeAPI(
     api_key=OKX_API_KEY,
     api_secret_key=OKX_API_SECRET,
@@ -164,39 +155,15 @@ okx_account_api = AccountAPI(
     flag="0",
     debug=True
 )
-okx_public_api = PublicAPI(
-    api_key=OKX_API_KEY,
-    api_secret_key=OKX_API_SECRET,
-    passphrase=OKX_PASSPHRASE,
-    flag="0",
-    debug=False
-)
-
-# Global DataFrame to store kline data
-kline_data = pd.DataFrame(
-    columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'],
-    dtype='float64'
-)
-kline_data['timestamp'] = pd.to_datetime(kline_data['timestamp'])
-
-# Trading state
-current_position = None
-trade_history = []
-pending_orders = []
-previous_st_line = None
-previous_trend = None
-latest_st_line = None
-latest_trend = None
+okx_public_api = PublicAPI(flag="0", debug=False)
 
 # File paths
 SYMBOL_CONFIG_FILE = 'symbol_configs.json'
 
-
 # Database initialization
 def init_db():
-    """Initialize SQLite database with extended schema."""
     global current_position, pending_orders
-    conn = sqlite3.connect('trade_history_v2.db', timeout=10)
+    conn = sqlite3.connect('trade_history_v2.db', timeout=20)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -254,13 +221,11 @@ def init_db():
     run_id = c.lastrowid
     conn.commit()
 
-    # Clear stale orders
     c.execute("DELETE FROM orders WHERE status = 'pending'")
     c.execute("DELETE FROM take_profits")
     c.execute("UPDATE trades SET exit_price = 0 WHERE exit_price IS NULL")
     conn.commit()
 
-    # State recovery
     symbol_config = load_symbol_config(OKX_TRADING_PAIR, okx_public_api)
     okx_position = sync_position_with_okx(okx_account_api, okx_trade_api, OKX_TRADING_PAIR)
     if okx_position:
@@ -272,7 +237,6 @@ def init_db():
                   (current_position['open_time'], TRADING_PAIR, TIMEFRAME, current_position['side'],
                    current_position['entry_price'], current_position['size'], current_position.get('stop_loss'),
                    current_position.get('stop_loss_order_id'), current_position.get('order_id'), current_position['position_id']))
-        # Set stop-loss if none exists
         if not current_position.get('stop_loss') and latest_st_line is not None and latest_trend is not None:
             stop_loss = latest_st_line - STOP_LOSS_OFFSET if latest_trend == 1 else latest_st_line + STOP_LOSS_OFFSET
             stop_loss_order_id = update_stop_loss(
@@ -286,7 +250,6 @@ def init_db():
                 c.execute("UPDATE trades SET stop_loss = ?, stop_loss_order_id = ? WHERE position_id = ?",
                           (stop_loss, stop_loss_order_id, current_position['position_id']))
         elif not current_position.get('stop_loss'):
-            # Fallback: Use entry price minus/plus a percentage if no ST line
             stop_loss = current_position['entry_price'] * (1 - 0.05) if current_position['side'] == 'LONG' else current_position['entry_price'] * (1 + 0.05)
             stop_loss_order_id = update_stop_loss(
                 okx_trade_api, OKX_TRADING_PAIR, current_position['side'],
@@ -303,7 +266,6 @@ def init_db():
         current_position = None
         logger.info("No active position found on OKX")
 
-    # Sync pending orders
     orders = okx_trade_api.get_order_list(instType="SWAP", instId=OKX_TRADING_PAIR, ordType="limit")
     if orders['code'] == "0":
         pending_orders.clear()
@@ -325,7 +287,6 @@ def init_db():
         if pending_orders:
             logger.info(f"Recovered {len(pending_orders)} pending orders from OKX")
 
-    # Sync filled orders only for open position
     if current_position:
         start_timestamp = int(datetime.fromisoformat(start_time.replace('+00:00', 'Z')).timestamp() * 1000)
         orders = okx_trade_api.get_orders_history(instType="SWAP", instId=OKX_TRADING_PAIR, ordType="limit", limit=100)
@@ -361,14 +322,8 @@ def init_db():
         logger.info("No open position, skipping historical order sync")
     return conn
 
-
-# Log error to database
-from tenacity import retry, wait_fixed, stop_after_attempt
-
-@retry(wait=wait_fixed(0.5), stop=stop_after_attempt(10))
 @retry(wait=wait_fixed(1), stop=stop_after_attempt(20))
 def log_error(error_message, context):
-    """Log errors to the database in a thread-safe manner."""
     try:
         conn = sqlite3.connect('trade_history_v2.db', timeout=30)
         c = conn.cursor()
@@ -383,12 +338,9 @@ def log_error(error_message, context):
     except Exception as e:
         logger.error(f"Failed to log error: {str(e)}")
 
-
-# Load or fetch symbol configuration
 def load_symbol_config(symbol, public_api):
-    """Load symbol configuration from JSON or OKX API."""
     try:
-        with open('symbol_configs.json', 'r') as f:
+        with open(SYMBOL_CONFIG_FILE, 'r') as f:
             content = f.read().strip()
             if not content:
                 logger.error("symbol_configs.json is empty")
@@ -409,7 +361,6 @@ def load_symbol_config(symbol, public_api):
         raise
 
 def fetch_symbol_config_from_api(symbol, public_api):
-    """Fetch symbol configuration from OKX API."""
     try:
         result = public_api.get_instruments(instType="SWAP", instId=symbol)
         if result['code'] != "0" or not result['data']:
@@ -420,7 +371,8 @@ def fetch_symbol_config_from_api(symbol, public_api):
             'lotSize': float(instrument.get('lotSz', 1.0)),
             'quantityPrecision': int(instrument.get('szPrec', 0)),
             'minQty': float(instrument.get('minSz', 1.0)),
-            'minNotional': float(instrument.get('minNotional', 5.0))
+            'minNotional': float(instrument.get('minNotional', 5.0)),
+            'pricePrecision': int(instrument.get('tickSz', 4))
         }
         logger.info(f"Fetched config for {symbol}: {config}")
         return config
@@ -428,20 +380,18 @@ def fetch_symbol_config_from_api(symbol, public_api):
         logger.error(f"Failed to fetch symbol config from API for {symbol}: {str(e)}")
         raise
 
-# Adjust quantity to match OKX precision
 def adjust_quantity(quantity, symbol_config, price):
-    """Adjust quantity to match OKX precision and minimum size, return asset units."""
-    contract_size = symbol_config['contractSize']  # e.g., 0.01 for XRP
+    contract_size = symbol_config['contractSize']
     lot_size = symbol_config.get('lotSize', 1.0)
     precision = symbol_config['quantityPrecision']
     min_qty = symbol_config['minQty']
     min_notional = symbol_config['minNotional']
     min_qty_notional = max(min_qty, min_notional / price / contract_size)
 
-    asset_size = quantity  # Input in asset units, e.g., 1000 XRP
+    asset_size = quantity
     logger.debug(f"Initial asset size: {asset_size:.4f} units")
 
-    contracts = asset_size / contract_size  # e.g., 1000 / 0.01 = 100,000 contracts
+    contracts = asset_size / contract_size
     logger.debug(f"Initial contracts: {contracts:.4f}")
 
     lots = contracts / lot_size
@@ -459,17 +409,13 @@ def adjust_quantity(quantity, symbol_config, price):
     return final_asset_size
 
 def adjust_price(price, symbol_config):
-    """Adjust price to match OKX precision."""
     precision = symbol_config.get('pricePrecision', 4)
     adjusted = round(price, precision)
     logger.debug(f"Adjusted price: {price:.8f} to {adjusted:.{precision}f}")
     return adjusted
 
-
-# Sync position with OKX
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 def sync_position_with_okx(account_api, trade_api, symbol):
-    """Sync current position with OKX."""
     try:
         positions = account_api.get_positions(instType="SWAP", instId=symbol)
         if positions['code'] != "0":
@@ -486,7 +432,7 @@ def sync_position_with_okx(account_api, trade_api, symbol):
         contract_size = symbol_config.get('contractSize', 0.01)
         size = abs(float(position['pos'])) * contract_size
 
-        orders = trade_api.order_algos_list(instType="SWAP", instId=symbol, ordType="conditional")
+        orders = trade_api.get_algo_order_list(instType="SWAP", instId=symbol, ordType="conditional")
         if orders['code'] != "0":
             raise Exception(f"Failed to fetch algo orders: {orders['msg']}")
         open_orders = orders['data']
@@ -507,7 +453,7 @@ def sync_position_with_okx(account_api, trade_api, symbol):
             'size': size,
             'stop_loss': stop_loss,
             'stop_loss_order_id': stop_loss_order_id,
-            'open_time': position.get('openTime', str(datetime.now(timezone.utc)))
+            'open_time': position.get('uTime', str(datetime.now(timezone.utc)))
         }
         logger.info(f"Synced position: {synced_position}")
         return synced_position
@@ -515,31 +461,28 @@ def sync_position_with_okx(account_api, trade_api, symbol):
         logger.error(f"Failed to sync position: {str(e)}")
         raise
 
-
-# Cancel all stop-loss orders
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 def cancel_all_stop_loss_orders(trade_api, symbol):
-    """Cancel all stop-loss orders for a symbol."""
     try:
-        orders = trade_api.order_algos_list(instType="SWAP", instId=symbol, ordType="conditional")
+        orders = trade_api.get_algo_order_list(instType="SWAP", instId=symbol, ordType="conditional")
         if orders['code'] != "0":
             raise Exception(f"Failed to fetch algo orders: {orders['msg']}")
         open_orders = orders['data']
-        stop_loss_orders = [order for order in open_orders if order['state'] == 'effective']
+        stop_loss_orders = [order for order in open_orders if order['state'] in ['live', 'effective']]
         if not stop_loss_orders:
             logger.debug(f"No stop-loss algo orders to cancel for {symbol}")
             return True
 
         for order in stop_loss_orders:
-            cancel_result = trade_api.cancel_algo_order(instId=symbol, algoId=order['algoId'])
+            cancel_result = trade_api.cancel_algo_order([{"instId": symbol, "algoId": order['algoId']}])
             if cancel_result['code'] != "0":
                 raise Exception(f"Failed to cancel algo order: {cancel_result['msg']}")
             logger.debug(f"Canceled stop-loss algo order ID: {order['algoId']}")
 
-        orders = trade_api.order_algos_list(instType="SWAP", instId=symbol, ordType="conditional")
+        orders = trade_api.get_algo_order_list(instType="SWAP", instId=symbol, ordType="conditional")
         if orders['code'] != "0":
             raise Exception(f"Failed to fetch algo orders after cancellation: {orders['msg']}")
-        remaining_orders = [order for order in orders['data'] if order['state'] == 'effective']
+        remaining_orders = [order for order in orders['data'] if order['state'] in ['live', 'effective']]
         if remaining_orders:
             logger.error(f"Failed to cancel all stop-loss orders. Remaining orders: {remaining_orders}")
             return False
@@ -550,12 +493,8 @@ def cancel_all_stop_loss_orders(trade_api, symbol):
         logger.error(f"Failed to cancel stop-loss orders: {str(e)}")
         raise
 
-
-# Update stop-loss order
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
-def update_stop_loss(trade_api, symbol, side, new_stop_price, current_stop_order_id, current_price, position_size,
-                     public_api, is_new_position=False):
-    """Update or place a new stop-loss order."""
+def update_stop_loss(trade_api, symbol, side, new_stop_price, current_stop_order_id, current_price, position_size, public_api, is_new_position=False):
     try:
         symbol_config = load_symbol_config(symbol, public_api)
         new_stop_price = adjust_price(new_stop_price, symbol_config)
@@ -571,12 +510,12 @@ def update_stop_loss(trade_api, symbol, side, new_stop_price, current_stop_order
 
         if current_stop_order_id:
             logger.debug(f"Modifying stop-loss order ID: {current_stop_order_id}")
-            amend_params = {
-                "instId": symbol,
-                "algoId": current_stop_order_id,
-                "newSlTriggerPx": str(new_stop_price)
-            }
-            amend_result = trade_api.amend_algo_order(**amend_params)
+            amend_result = trade_api.amend_algo_order(
+                instId=symbol,
+                algoId=current_stop_order_id,
+                newSlTriggerPx=str(new_stop_price),
+                newSlTriggerPxType="mark"
+            )
             if amend_result['code'] != "0":
                 if "Position does not exist" in amend_result.get('msg', '') or amend_result.get('code') == "51169":
                     logger.warning(f"No position exists to amend stop-loss for {symbol}")
@@ -616,19 +555,27 @@ def update_stop_loss(trade_api, symbol, side, new_stop_price, current_stop_order
         logger.error(f"Failed to update stop-loss: {str(e)}")
         raise
 
-
-# Place multiple limit orders
 def place_limit_orders(trend, st_line, conn, symbol_config):
-    """Place multiple limit orders based on trend and ST_LINE."""
     global pending_orders
     min_range, max_range = ORDERS_RANGE[1] / 100, ORDERS_RANGE[0] / 100
-    base_size = POSITION_SIZE / ORDERS_PER_TRADE  # Asset units, e.g., 100 XRP
+    base_size = POSITION_SIZE / ORDERS_PER_TRADE
 
     try:
         db_conn = sqlite3.connect('trade_history_v2.db', timeout=20)
         c = db_conn.cursor()
         c.execute("SELECT id FROM bot_runs ORDER BY id DESC LIMIT 1")
         run_id = c.fetchone()[0]
+
+        balance = okx_account_api.get_balance()
+        if balance['code'] != "0":
+            logger.error(f"Failed to fetch balance: {balance['msg']}")
+            return
+        available_usdt = float(next((bal['availBal'] for bal in balance['data'][0]['details'] if bal['ccy'] == 'USDT'), 0))
+        required_margin = (POSITION_SIZE * st_line) / 10  # 10x leverage
+        if available_usdt < required_margin:
+            logger.error(f"Insufficient margin: Available {available_usdt} USDT, Required {required_margin} USDT")
+            log_error(f"Insufficient margin: Available {available_usdt} USDT, Required {required_margin} USDT", "place_limit_orders")
+            return
 
         try:
             orders = okx_trade_api.get_order_list(instType="SWAP", instId=OKX_TRADING_PAIR, ordType="limit")
@@ -656,10 +603,10 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
         orders = []
         for i in range(ORDERS_PER_TRADE):
             price = base_price + (i / (ORDERS_PER_TRADE - 1)) * price_range if ORDERS_PER_TRADE > 1 else base_price
-            size = base_size * (1 + random.uniform(-0.1, 0.1))  # Asset units, e.g., 90–110 XRP
+            size = base_size * (1 + random.uniform(-0.1, 0.1))
             price = adjust_price(price, symbol_config)
-            asset_size = adjust_quantity(size, symbol_config, price)  # Returns asset units
-            contract_size = round(asset_size / symbol_config['contractSize'], symbol_config['quantityPrecision'])  # Round to precision
+            asset_size = adjust_quantity(size, symbol_config, price)
+            contract_size = round(asset_size / symbol_config['contractSize'], symbol_config['quantityPrecision'])
             logger.debug(f"Preparing order: {side} at {price} with size {asset_size:.4f} asset units ({contract_size:.2f} contracts)")
             orders.append({
                 'instId': OKX_TRADING_PAIR,
@@ -709,39 +656,35 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
         if 'db_conn' in locals():
             db_conn.close()
 
-
-# Place take-profit orders
 def place_tp_orders(fill_data, conn, symbol_config):
-    """Place take-profit orders for a filled order."""
     try:
-        db_conn = sqlite3.connect('trade_history_v2.db', timeout=10)
+        db_conn = sqlite3.connect('trade_history_v2.db', timeout=20)
         c = db_conn.cursor()
         c.execute("SELECT id FROM bot_runs ORDER BY id DESC LIMIT 1")
         run_id = c.fetchone()[0]
 
-        fill_size = fill_data['size']  # Asset units, e.g., 104 XRP
-        fill_price = fill_data['price']  # e.g., 2.1669 USDT/XRP
-        side = 'sell' if fill_data['side'] == 'buy' else 'buy'  # Reduce-only opposite side
+        fill_size = fill_data['size']
+        fill_price = fill_data['price']
+        side = 'sell' if fill_data['side'] == 'buy' else 'buy'
         position_id = fill_data.get('position_id')
 
-        # Handle TP_PERCENTAGES as string or list
         if isinstance(TP_PERCENTAGES, str):
             tp_percentages = [float(p) for p in TP_PERCENTAGES.split(',')]
         else:
-            tp_percentages = [float(p) for p in TP_PERCENTAGES]  # Already a list
-        tp_size = fill_size / len(tp_percentages)  # e.g., 104 / 5 ≈ 20.8 XRP
-        min_qty = symbol_config['minQty'] * symbol_config['contractSize']  # Min asset units
-        min_notional = symbol_config['minNotional']  # Min USDT value
+            tp_percentages = [float(p) for p in TP_PERCENTAGES]
+        tp_size = fill_size / len(tp_percentages)
+        min_qty = symbol_config['minQty'] * symbol_config['contractSize']
+        min_notional = symbol_config['minNotional']
 
         orders = []
         for i, percentage in enumerate(tp_percentages):
             tp_price = fill_price * (1 + percentage / 100) if fill_data['side'] == 'buy' else fill_price * (1 - percentage / 100)
             tp_price = adjust_price(tp_price, symbol_config)
-            tp_size_adjusted = adjust_quantity(tp_size, symbol_config, tp_price)  # Ensure compliance
+            tp_size_adjusted = adjust_quantity(tp_size, symbol_config, tp_price)
             if tp_size_adjusted * tp_price < min_notional or tp_size_adjusted < min_qty:
                 logger.warning(f"TP order size {tp_size_adjusted:.4f} at {tp_price} below minQty or minNotional, skipping")
                 continue
-            contract_size = tp_size_adjusted / symbol_config['contractSize']  # Convert to contracts
+            contract_size = round(tp_size_adjusted / symbol_config['contractSize'], symbol_config['quantityPrecision'])
             logger.debug(f"Preparing TP order: {side} at {tp_price} with size {tp_size_adjusted:.4f} asset units ({contract_size:.2f} contracts)")
             orders.append({
                 'instId': OKX_TRADING_PAIR,
@@ -787,10 +730,7 @@ def place_tp_orders(fill_data, conn, symbol_config):
         if 'db_conn' in locals():
             db_conn.close()
 
-
-# Refill position after TP hit
 def refill_position(tp_order, st_line, trend, conn, symbol_config):
-    """Place a single limit order to refill position after TP hit."""
     global pending_orders
     min_range, max_range = ORDERS_RANGE[1] / 100, ORDERS_RANGE[0] / 100
     if trend == 1:
@@ -802,33 +742,31 @@ def refill_position(tp_order, st_line, trend, conn, symbol_config):
 
     price = adjust_price(base_price, symbol_config)
     size = adjust_quantity(tp_order['size'], symbol_config, price)
+    contract_size = round(size / symbol_config['contractSize'], symbol_config['quantityPrecision'])
     order = {
         'instId': OKX_TRADING_PAIR,
         'tdMode': 'isolated',
         'side': side,
         'ordType': 'limit',
         'px': str(price),
-        'sz': str(size)
+        'sz': str(contract_size)
     }
     result = okx_trade_api.place_order(**order)
     if result['code'] != "0":
         logger.error(f"Failed to place refill order: {result['msg']}")
-        log_error(conn, result['msg'], "refill_position")
+        log_error(str(result['msg']), "refill_position")
         return
 
     order_id = result['data'][0]['ordId']
     c = conn.cursor()
-    c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
-              (1, order_id, side, price, float(size), 'pending', str(datetime.now(timezone.utc))))
-    pending_orders.append({'order_id': order_id, 'side': side, 'price': price, 'size': float(size)})
+    c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id, run_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+              (1, order_id, side, price, size, 'pending', str(datetime.now(timezone.utc)), None, c.execute("SELECT id FROM bot_runs ORDER BY id DESC LIMIT 1").fetchone()[0]))
+    pending_orders.append({'order_id': order_id, 'side': side, 'price': price, 'size': size, 'position_id': None})
     conn.commit()
-    logger.info(f"Refilled position with order at {price} for {size}")
+    logger.info(f"Refilled position with order at {price} for {size} units")
 
-
-# WebSocket handler for order fills
 def order_websocket_handler(conn):
-    """Handle WebSocket for order fill events and push to Redis."""
     logger.info(f"Starting order WebSocket handler for {BOT_INSTANCE_ID}")
     symbol_config = load_symbol_config(OKX_TRADING_PAIR, okx_public_api)
 
@@ -877,7 +815,7 @@ def order_websocket_handler(conn):
                 for order in data['data']:
                     logger.debug(f"Processing order: {order}")
                     if order['state'] == 'filled':
-                        conn_poll = sqlite3.connect('trade_history_v2.db', timeout=10)
+                        conn_poll = sqlite3.connect('trade_history_v2.db', timeout=20)
                         c = conn_poll.cursor()
                         c.execute("SELECT position_id FROM orders WHERE order_id = ?", (order['ordId'],))
                         result = c.fetchone()
@@ -895,13 +833,13 @@ def order_websocket_handler(conn):
                         conn_poll.close()
                     elif order['state'] in ['canceled', 'rejected'] and order.get('reduceOnly', 'false') == 'true':
                         logger.warning(f"TP order {order['ordId']} {order['state']}: {order.get('sMsg', 'No message')}")
-                        conn_poll = sqlite3.connect('trade_history_v2.db', timeout=10)
+                        conn_poll = sqlite3.connect('trade_history_v2.db', timeout=20)
                         c = conn_poll.cursor()
                         c.execute("UPDATE take_profits SET status = ? WHERE order_id = ?", (order['state'], order['ordId']))
                         conn_poll.commit()
                         conn_poll.close()
                     elif order['state'] == 'filled' and order['ordType'] == 'limit' and order.get('reduceOnly', 'false') == 'true':
-                        conn_poll = sqlite3.connect('trade_history_v2.db', timeout=10)
+                        conn_poll = sqlite3.connect('trade_history_v2.db', timeout=20)
                         c = conn_poll.cursor()
                         c.execute("UPDATE take_profits SET status = 'filled' WHERE order_id = ?", (order['ordId'],))
                         conn_poll.commit()
@@ -925,7 +863,7 @@ def order_websocket_handler(conn):
     def poll_orders():
         while True:
             try:
-                conn_poll = sqlite3.connect('trade_history_v2.db', timeout=10)
+                conn_poll = sqlite3.connect('trade_history_v2.db', timeout=20)
                 c = conn_poll.cursor()
                 orders = okx_trade_api.get_orders_history(instType="SWAP", instId=OKX_TRADING_PAIR, ordType="limit", limit=100)
                 if orders['code'] == "0":
@@ -963,11 +901,8 @@ def order_websocket_handler(conn):
     )
     ws.run_forever()
 
-
-# Process fill events from Redis
 @retry(wait=wait_fixed(0.5), stop=stop_after_attempt(10))
 def process_fill_events(symbol_config):
-    """Process order fill events from Redis queue."""
     global current_position
     while True:
         try:
@@ -1025,14 +960,11 @@ def process_fill_events(symbol_config):
             logger.error(f"Error processing fill event: {str(e)}")
             log_error(str(e), "process_fill_events")
 
-
-# Fetch historical kline data
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10))
 def fetch_historical_data(symbol=TRADING_PAIR, interval=TIMEFRAME, limit=1000, end_time=None, num_batches=2):
-    """Fetch historical kline data with retries."""
     global kline_data, historical_data_fetched
     try:
-        logger.debug(f"Fetching historical data for {symbol}, interval={interval}, limit={limit}")
+        logger.info(f"Fetching historical data for {symbol}, interval={interval}, limit={limit}")
         mainnet_client = UMFutures(key=BINANCE_API_KEY, secret=BINANCE_API_SECRET, base_url="https://fapi.binance.com")
         all_data = pd.DataFrame()
         for batch in range(num_batches):
@@ -1042,7 +974,7 @@ def fetch_historical_data(symbol=TRADING_PAIR, interval=TIMEFRAME, limit=1000, e
             logger.debug(f"Requesting klines: {params}")
             klines = mainnet_client.klines(**params, timeout=10)
             if not klines:
-                logger.warning(f"{Fore.YELLOW}No historical data returned from API for batch {batch}.{Style.RESET_ALL}")
+                logger.warning(f"No historical data returned from API for batch {batch}")
                 break
             batch_data = pd.DataFrame({
                 'timestamp': [int(k[0]) for k in klines],
@@ -1063,15 +995,13 @@ def fetch_historical_data(symbol=TRADING_PAIR, interval=TIMEFRAME, limit=1000, e
         kline_data = pd.concat([all_data, kline_data], ignore_index=True)
         kline_data = kline_data.tail(2000)
         historical_data_fetched = True
-        logger.info(f"{Fore.CYAN}Fetched {len(all_data)} historical candles, total size: {len(kline_data)}{Style.RESET_ALL}")
+        logger.info(f"Fetched {len(all_data)} historical candles, total size: {len(kline_data)}")
     except Exception as e:
-        logger.error(f"{Fore.RED}Error fetching historical data: {str(e)}{Style.RESET_ALL}")
-        log_error(conn, str(e), "fetch_historical_data")
+        logger.error(f"Error fetching historical data: {str(e)}")
+        log_error(str(e), "fetch_historical_data")
         raise
 
-# Calculate ATR
 def calculate_atr(df, period):
-    """Calculate Average True Range."""
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift(1))
     low_close = np.abs(df['low'] - df['close'].shift(1))
@@ -1082,16 +1012,10 @@ def calculate_atr(df, period):
         atr.iloc[i] = (atr.iloc[i - 1] * (period - 1) + true_range.iloc[i]) / period
     return atr
 
-
-# Calculate EMA
 def calculate_ema(series, period):
-    """Calculate Exponential Moving Average."""
     return series.ewm(span=period, adjust=False).mean()
 
-
-# Calculate Supertrend
 def calculate_supertrend(df, atr_period, atr_ratio):
-    """Calculate Supertrend indicator."""
     atr = calculate_atr(df, atr_period)
     atr_smma = calculate_ema(atr, atr_period)
     delta_stop = atr_smma * atr_ratio
@@ -1125,11 +1049,8 @@ def calculate_supertrend(df, atr_period, atr_ratio):
         line_st = pd.Series(np.where(trend == 1, trend_up, trend_down), index=df.index)
     return line_st, trend
 
-
-# WebSocket callback functions for candles
 def on_open(ws):
-    """Handle WebSocket opening."""
-    logger.info(f"{Fore.CYAN}Candle WebSocket opened{Style.RESET_ALL}")
+    logger.info(f"{Fore.BLUE}Candle WebSocket opened{Style.RESET_ALL}")
     subscription = {
         "method": "SUBSCRIBE",
         "params": [f"{TRADING_PAIR.lower()}@kline_{TIMEFRAME}"],
@@ -1137,9 +1058,7 @@ def on_open(ws):
     }
     ws.send(json.dumps(subscription))
 
-
 def on_message(ws, message):
-    """Handle WebSocket messages for candles."""
     global kline_data, previous_st_line, previous_trend, current_position, conn, latest_st_line, latest_trend, historical_data_fetched, first_closed_candle
     try:
         data = json.loads(message)
@@ -1167,11 +1086,11 @@ def on_message(ws, message):
                 logger.info("Fetching historical data for first closed candle")
                 fetch_historical_data(limit=1000, end_time=int(kline['t']) - 1, num_batches=2)
                 if len(kline_data) < ATR_PERIOD:
-                    logger.warning(f"{Fore.YELLOW}Insufficient data after fetch: {len(kline_data)} candles, need {ATR_PERIOD}{Style.RESET_ALL}")
+                    logger.warning(f"Insufficient data after fetch: {len(kline_data)} candles, need {ATR_PERIOD}")
                     return
 
             if len(kline_data) < ATR_PERIOD:
-                logger.warning(f"{Fore.YELLOW}Insufficient data: {len(kline_data)} candles, need {ATR_PERIOD}{Style.RESET_ALL}")
+                logger.warning(f"Insufficient data: {len(kline_data)} candles, need {ATR_PERIOD}")
                 return
 
             df = kline_data.copy()
@@ -1228,7 +1147,7 @@ def on_message(ws, message):
                             tdMode="isolated",
                             side=close_side,
                             ordType="market",
-                            sz=str(close_quantity / symbol_config['contractSize']),
+                            sz=str(round(close_quantity / symbol_config['contractSize'], symbol_config['quantityPrecision'])),
                             reduceOnly="true"
                         )
                         if close_result['code'] != "0":
@@ -1267,42 +1186,33 @@ def on_message(ws, message):
             previous_trend = latest_trend
 
     except Exception as e:
-        logger.error(f"{Fore.RED}Candle WebSocket error: {str(e)} (Message: {message}){Style.RESET_ALL}")
+        logger.error(f"Candle WebSocket error: {str(e)} (Message: {message})")
         log_error(f"Candle WebSocket error: {str(e)}", "on_message")
 
-
 def on_error(ws, error):
-    """Handle WebSocket errors."""
-    logger.error(f"{Fore.RED}Candle WebSocket error: {str(error)}{Style.RESET_ALL}")
-    log_error(conn, str(error), "on_error")
-
+    logger.error(f"Candle WebSocket error: {str(error)}")
+    log_error(str(error), "on_error")
 
 def on_close(ws, close_status_code, close_msg):
-    """Handle WebSocket closing."""
-    logger.info(f"{Fore.CYAN}Candle WebSocket closed: {close_status_code} - {close_msg}{Style.RESET_ALL}")
+    logger.info(f"Candle WebSocket closed: {close_status_code} - {close_msg}")
     reconnect(ws)
 
-
 def reconnect(ws):
-    """Reconnect WebSocket on failure."""
     delay = 5
     while True:
         try:
             ws.close()
-            logger.info(f"{Fore.YELLOW}Reconnecting in {delay} seconds...{Style.RESET_ALL}")
+            logger.info(f"Reconnecting in {delay} seconds...")
             time.sleep(delay)
             ws.run_forever()
-            logger.info(f"{Fore.GREEN}WebSocket reconnected successfully{Style.RESET_ALL}")
+            logger.info(f"WebSocket reconnected successfully")
             break
         except Exception as e:
-            logger.error(f"{Fore.RED}Reconnection failed: {str(e)}{Style.RESET_ALL}")
+            logger.error(f"Reconnection failed: {str(e)}")
             delay = min(delay * 2, 60)
 
-
 def main():
-    """Main function to start the trading bot."""
     global conn, latest_st_line, latest_trend
-    # Check for running instance
     current_pid = os.getpid()
     for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
         if proc.pid != current_pid and 'python' in proc.name().lower() and 'okx_bot_v2.py' in ' '.join(proc.cmdline()):
@@ -1311,16 +1221,13 @@ def main():
 
     conn = init_db()
 
-    # Start order WebSocket handler
     order_thread = threading.Thread(target=order_websocket_handler, args=(conn,), daemon=True)
     order_thread.start()
 
-    # Start fill event processor
     symbol_config = load_symbol_config(OKX_TRADING_PAIR, okx_public_api)
     fill_thread = threading.Thread(target=process_fill_events, args=(symbol_config,), daemon=True)
     fill_thread.start()
 
-    # Start Binance WebSocket for candles
     websocket_url = "wss://fstream.binance.com/stream"
     ws = websocket.WebSocketApp(
         websocket_url,
@@ -1337,7 +1244,6 @@ def main():
         c.execute("UPDATE bot_runs SET end_time = ? WHERE end_time IS NULL", (str(datetime.now(timezone.utc)),))
         conn.commit()
         conn.close()
-
 
 if __name__ == "__main__":
     main()

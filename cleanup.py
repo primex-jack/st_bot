@@ -25,11 +25,11 @@ def load_config(config_path='config.json'):
         logger.error(f"Failed to load config from {config_path}: {str(e)}")
         raise
 
-def cleanup_okx_positions_and_orders(api_key, api_secret, passphrase, inst_id='XRP-USDT-SWAP'):
+def cleanup_okx_positions_and_orders(api_key, api_secret_key, passphrase, inst_id='XRP-USDT-SWAP'):
     """Close positions and cancel orders on OKX."""
     trade_api = TradeAPI(
         api_key=api_key,
-        api_secret=api_secret,
+        api_secret_key=api_secret_key,
         passphrase=passphrase,
         flag="0",  # Live trading
         debug=True
@@ -103,15 +103,15 @@ def main():
 
     config = load_config()
     api_key = config.get('okx_api_key')
-    api_secret = config.get('okx_api_secret')
+    api_secret_key = config.get('okx_api_secret')
     passphrase = config.get('okx_passphrase')
-    inst_id = config.get('trading_pair', 'XRP-USDT-SWAP')
+    inst_id = config.get('trading_pair', 'XRP-USDT-SWAP').replace("USDT", "-USDT-SWAP")
 
-    if not all([api_key, api_secret, passphrase]):
+    if not all([api_key, api_secret_key, passphrase]):
         logger.error("Missing OKX API credentials in config.json")
         return
 
-    cleanup_okx_positions_and_orders(api_key, api_secret, passphrase, inst_id)
+    cleanup_okx_positions_and_orders(api_key, api_secret_key, passphrase, inst_id)
 
     if args.delete_db:
         delete_database()
