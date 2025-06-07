@@ -17,6 +17,7 @@ import redis
 import threading
 import random
 import uuid
+import psutil
 from okx.Trade import TradeAPI
 from okx.Account import AccountAPI
 from okx.PublicData import PublicAPI
@@ -458,12 +459,34 @@ def adjust_quantity(quantity, symbol_config, price):
 
 
 # Adjust price to match OKX precision
-def adjust_price(price, symbol_config):
-    """Adjust price to match OKX precision."""
-    precision = symbol_config['pricePrecision']
-    adjusted = round(price, precision)
-    logger.debug(f"Adjusted price: {adjusted}")
-    return adjusted
+def adjust_quantity(quantity, symbol_config, price):
+    """Adjust quantity to match OKX precision and minimum size, return asset units."""
+    contract_size = symbol_config['contractSize']  # e.g., 0.01 for XRP
+    lot_size = symbol_config.get('lotSize', 1.0)
+    precision = symbol_config['quantityPrecision']
+    min_qty = symbol_config['minQty']
+    min_notional = symbol_config['minNotional']
+    min_qty_notional = max(min_qty, min_notional / price / contract_size)
+
+    asset_size = quantity  # Input in asset units, e.g., 100 XRP
+    logger.debug(f"Initial asset size: {asset_size:.4f} units")
+
+    contracts = asset_size / contract_size  # e.g., 100 / 0.01 = 10,000 contracts
+    logger.debug(f"Initial contracts: {contracts:.4f}")
+
+    lots = contracts / lot_size
+    rounded_lots = round(max(lots, min_qty_notional / lot_size))
+    adjusted_contracts = rounded_lots * lot_size
+    adjusted = round(adjusted_contracts, precision)
+
+    adjusted = round(adjusted / lot_size) * lot_size
+    if adjusted < min_qty:
+        adjusted = min_qty
+        logger.debug(f"Adjusted quantity increased to meet minQty: {adjusted} contracts")
+
+    final_asset_size = adjusted * contract_size
+    logger.debug(f"Adjusted quantity: {adjusted} contracts = {final_asset_size:.4f} asset units")
+    return final_asset_size
 
 
 # Sync position with OKX
@@ -622,7 +645,7 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
     """Place multiple limit orders based on trend and ST_LINE."""
     global pending_orders
     min_range, max_range = ORDERS_RANGE[1] / 100, ORDERS_RANGE[0] / 100
-    base_size = POSITION_SIZE  # Asset units, e.g., 1000 XRP
+    base_size = POSITION_SIZE / ORDERS_PER_TRADE  # Asset units, e.g., 100 XRP
 
     try:
         db_conn = sqlite3.connect('trade_history_v2.db', timeout=20)
@@ -654,37 +677,33 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
             side = 'sell'
 
         orders = []
-        price = base_price
-        size = base_size * (1 + random.uniform(-0.1, 0.1))  # Asset units, e.g., 900–1100 XRP
-        price = adjust_price(price, symbol_config)
-        asset_size = adjust_quantity(size, symbol_config, price)  # Returns asset units
-        contract_size = asset_size / symbol_config['contractSize']  # Convert to contracts
-        logger.debug(f"Preparing order: {side} at {price} with size {asset_size:.4f} asset units ({contract_size:.2f} contracts)")
-        orders.append({
-            'instId': OKX_TRADING_PAIR,
-            'tdMode': 'isolated',
-            'side': side,
-            'ordType': 'limit',
-            'px': str(price),
-            'sz': str(contract_size)
-        })
-        pending_orders.append({'price': price, 'size': asset_size, 'side': side, 'position_id': None})
+        for i in range(ORDERS_PER_TRADE):
+            price = base_price + (i / (ORDERS_PER_TRADE - 1)) * price_range if ORDERS_PER_TRADE > 1 else base_price
+            size = base_size * (1 + random.uniform(-0.1, 0.1))  # Asset units, e.g., 90–110 XRP
+            price = adjust_price(price, symbol_config)
+            asset_size = adjust_quantity(size, symbol_config, price)  # Returns asset units
+            contract_size = round(asset_size / symbol_config['contractSize'], symbol_config['quantityPrecision'])  # Round to precision
+            logger.debug(f"Preparing order: {side} at {price} with size {asset_size:.4f} asset units ({contract_size:.2f} contracts)")
+            orders.append({
+                'instId': OKX_TRADING_PAIR,
+                'tdMode': 'isolated',
+                'side': side,
+                'ordType': 'limit',
+                'px': str(price),
+                'sz': str(contract_size)
+            })
+            pending_orders.append({'price': price, 'size': asset_size, 'side': side, 'position_id': None})
 
         batch_result = okx_trade_api.place_multiple_orders(orders)
         placed_count = 0
         if batch_result['code'] != "0":
             logger.error(f"Failed to place limit orders: {batch_result['msg']}")
-            log_error(f"Failed to place limit orders: {batch_result['msg']}", "place_limit_orders")
             for order_data in batch_result['data']:
                 if order_data['sCode'] != "0":
-                    logger.warning(f"Order failed: {order_data['sMsg']} (Price: {order_data.get('px')}, Size: {order_data.get('sz')})")
-                elif order_data['sCode'] == "0":
-                    order_id = order_data['ordId']
-                    c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id, run_id)
-                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                              (1, order_id, side, float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'],
-                               'pending', str(datetime.now(timezone.utc)), None, run_id))
+                    logger.error(f"Order failed: {order_data['sMsg']} (Price: {order_data.get('px')}, Size: {order_data.get('sz')})")
+                else:
                     placed_count += 1
+            log_error(f"Failed to place limit orders: {batch_result['msg']} - Details: {batch_result['data']}", "place_limit_orders")
             if placed_count == 0:
                 pending_orders = []
                 c.execute("DELETE FROM orders WHERE status = 'pending'")
@@ -694,16 +713,16 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
 
         c = db_conn.cursor()
         for order_data, order in zip(batch_result['data'], orders):
-            if order_data['sCode'] == "0":
-                order_id = order_data['ordId']
-                c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id, run_id)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                          (1, order_id, order['side'], float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'],
-                           'pending', str(datetime.now(timezone.utc)), None, run_id))
-                placed_count += 1
-            else:
-                logger.warning(f"Order failed: {order_data['sMsg']} (Price: {order_data.get('px')}, Size: {order_data.get('sz')})")
+            if order_data['sCode'] != "0":
+                logger.error(f"Order failed: {order_data['sMsg']} (Price: {order_data.get('px')}, Size: {order_data.get('sz')})")
                 pending_orders = [o for o in pending_orders if o['price'] != float(order_data.get('px', 0))]
+                continue
+            order_id = order_data['ordId']
+            c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id, run_id)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                      (1, order_id, order['side'], float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'],
+                       'pending', str(datetime.now(timezone.utc)), None, run_id))
+            placed_count += 1
         db_conn.commit()
         logger.info(f"Placed {placed_count} limit orders for trend {trend}")
     except Exception as e:
@@ -1306,15 +1325,22 @@ def reconnect(ws):
 def main():
     """Main function to start the trading bot."""
     global conn, latest_st_line, latest_trend
+    # Check for running instance
+    current_pid = os.getpid()
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        if proc.pid != current_pid and 'python' in proc.name().lower() and 'okx_bot_v2.py' in ' '.join(proc.cmdline()):
+            logger.error(f"Another instance of okx_bot_v2.py is running (PID {proc.pid}). Exiting.")
+            sys.exit(1)
+
     conn = init_db()
 
     # Start order WebSocket handler
-    order_thread = threading.Thread(target=order_websocket_handler, args=(conn,))
+    order_thread = threading.Thread(target=order_websocket_handler, args=(conn,), daemon=True)
     order_thread.start()
 
     # Start fill event processor
     symbol_config = load_symbol_config(OKX_TRADING_PAIR, okx_public_api)
-    fill_thread = threading.Thread(target=process_fill_events, args=(symbol_config,))
+    fill_thread = threading.Thread(target=process_fill_events, args=(symbol_config,), daemon=True)
     fill_thread.start()
 
     # Start Binance WebSocket for candles
