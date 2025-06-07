@@ -589,7 +589,7 @@ def place_tp_orders(fill_data, run_id, symbol_config):
     try:
         with db_lock:
             c = db_conn.cursor()
-            fill_size = fill_data['size'] / symbol_config['contractSize'] / 100  # Adjust for OKX's scaling
+            fill_size = fill_data['size'] / symbol_config['contractSize'] / 100  # e.g., 0.01 / 0.01 / 100 = 1 contract
             fill_price = fill_data['price']
             side = 'sell' if fill_data['side'] == 'buy' else 'buy'
             position_id = fill_data.get('position_id')
@@ -598,7 +598,7 @@ def place_tp_orders(fill_data, run_id, symbol_config):
                 tp_percentages = [float(p) for p in TP_PERCENTAGES.split(',')]
             else:
                 tp_percentages = [float(p) for p in TP_PERCENTAGES]
-            tp_size = fill_size / len(tp_percentages)  # e.g., 100 / 5 = 20 contracts
+            tp_size = fill_size / len(tp_percentages)  # e.g., 1 / 5 = 0.2 contracts
             min_qty = symbol_config['minQty']  # 0.01 contracts
             min_notional = symbol_config['minNotional']  # 0.01 USDT
 
@@ -606,15 +606,15 @@ def place_tp_orders(fill_data, run_id, symbol_config):
             for i, percentage in enumerate(tp_percentages):
                 tp_price = fill_price * (1 + percentage / 100) if fill_data['side'] == 'buy' else fill_price * (1 - percentage / 100)
                 tp_price = adjust_price(tp_price, symbol_config)
-                tp_contract_size = adjust_quantity(tp_size * symbol_config['contractSize'] * 100, symbol_config, tp_price)
+                tp_contract_size = adjust_quantity(tp_size * symbol_config['contractSize'] * 100, symbol_config, tp_price)  # e.g., 0.2 * 0.01 * 100 = 0.2 XRP
                 if tp_contract_size < min_qty:
                     logger.debug(f"TP order size {tp_contract_size:.2f} contracts below minQty {min_qty}, adjusting")
                     tp_contract_size = min_qty
-                tp_asset_size = tp_contract_size * symbol_config['contractSize'] * 100
+                tp_asset_size = tp_contract_size * symbol_config['contractSize'] * 100  # e.g., 0.01 * 0.01 * 100 = 0.1 XRP
                 if tp_asset_size * tp_price < min_notional:
                     logger.warning(f"TP order notional {tp_asset_size * tp_price:.4f} USDT below minNotional {min_notional}, skipping")
                     continue
-                logger.debug(f"Preparing TP order: {side} at {tp_price:.4f} with size {tp_contract_size:.2f} contracts ({tp_asset_size:.4f} XRP)")
+                logger.debug(f"Preparing TP order: {side} at {tp_price:.4f} with size {tp_contract_size:.2f} contracts ({tp_asset_size:.2f} XRP)")
                 orders.append({
                     'instId': OKX_TRADING_PAIR,
                     'tdMode': 'isolated',
@@ -624,7 +624,36 @@ def place_tp_orders(fill_data, run_id, symbol_config):
                     'sz': str(tp_contract_size),
                     'reduceOnly': 'true'
                 })
-            # ... (rest of the function) ...
+
+            if not orders:
+                logger.warning("No valid TP orders to place")
+                return
+
+            batch_result = okx_trade_api.place_multiple_orders(orders)
+            placed_count = 0
+            if batch_result['code'] != "0":
+                logger.error(f"Failed to place TP orders: {batch_result['msg']}")
+                log_error("PlaceTPError", batch_result['msg'], "place_tp_orders")
+                return
+
+            for order_data, order in zip(batch_result['data'], orders):
+                if order_data['sCode'] != "0":
+                    logger.warning(f"TP order failed: {order_data['sMsg']} (Price: {order_data.get('px', 'N/A')}, Size: {order_data.get('sz', 'N/A')})")
+                    continue
+                order_id = order_data['ordId']
+                c.execute('''INSERT INTO take_profits (trade_id, tp_level, order_id, price, size, status, timestamp, position_id, run_id)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                          (1, placed_count + 1, order_id, float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'] * 100,
+                           'pending', str(datetime.now(timezone.utc)), position_id, run_id))
+                placed_count += 1
+            db_conn.commit()
+            if placed_count > 0:
+                logger.info(f"Placed {placed_count} TP orders for filled order")
+            else:
+                logger.warning("No TP orders placed due to failures")
+    except Exception as e:
+        logger.error(f"Error in place_tp_orders: {str(e)}")
+        log_error("GeneralError", str(e), "place_tp_orders")
 
 def refill_position(tp_order, st_line, trend, run_id, symbol_config):
     global pending_orders
