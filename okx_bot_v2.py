@@ -563,13 +563,14 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
         c.execute("SELECT id FROM bot_runs ORDER BY id DESC LIMIT 1")
         run_id = c.fetchone()[0]
 
-        balance = okx_account_api.get_balance()
+        balance = okx_account_api.get_account_balance()
         if balance['code'] != "0":
             logger.error(f"Failed to fetch balance: {balance['msg']}")
+            log_error(f"Failed to fetch balance: {balance['msg']}", "place_limit_orders")
             return
         available_usdt = float(next((bal['availBal'] for bal in balance['data'][0]['details'] if bal['ccy'] == 'USDT'), 0))
         frozen_usdt = float(next((bal['frozenBal'] for bal in balance['data'][0]['details'] if bal['ccy'] == 'USDT'), 0))
-        required_margin = (POSITION_SIZE * st_line) / 10
+        required_margin = (POSITION_SIZE * st_line) / 10  # 10x leverage
         if available_usdt < required_margin:
             logger.error(f"Insufficient margin: Available {available_usdt:.2f} USDT, Frozen {frozen_usdt:.2f} USDT, Required {required_margin:.2f} USDT")
             log_error(f"Insufficient margin: Available {available_usdt:.2f} USDT, Frozen {frozen_usdt:.2f} USDT, Required {required_margin:.2f} USDT", "place_limit_orders")
