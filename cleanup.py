@@ -31,7 +31,7 @@ def cleanup_okx_positions_and_orders(api_key, api_secret_key, passphrase, inst_i
         api_key=api_key,
         api_secret_key=api_secret_key,
         passphrase=passphrase,
-        flag="0",  # Live trading
+        flag="0",
         debug=True
     )
 
@@ -70,6 +70,26 @@ def cleanup_okx_positions_and_orders(api_key, api_secret_key, passphrase, inst_i
             logger.info(f"No open position to close: {result['msg']}")
     except Exception as e:
         logger.error(f"Error closing position: {str(e)}")
+
+    # Delete database
+    try:
+        if os.path.exists('trade_db_v2.db'):
+            os.remove('trade_db_v2.db')
+            logger.info("Deleted database: trade_db_v2.db")
+        if os.path.exists('trade_db_v2.db-shm'):
+            os.remove('trade_db_v2.db-shm')
+        if os.path.exists('trade_db_v2.db-wal'):
+            os.remove('trade_db_v2.db-wal')
+    except Exception as e:
+        logger.error(f"Error deleting database: {str(e)}")
+
+    # Clear Redis
+    try:
+        redis_client = redis.Redis(host='localhost', port=6379, db=0)
+        redis_client.delete(f"bot_{BOT_INSTANCE_ID}_fill_queue")
+        logger.info(f"Cleared Redis queue: bot_{BOT_INSTANCE_ID}_fill_queue")
+    except Exception as e:
+        logger.error(f"Error clearing Redis: {str(e)}")
 
 def delete_database(db_path='trade_history_v2.db'):
     """Delete the SQLite database file."""

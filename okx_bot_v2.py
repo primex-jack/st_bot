@@ -384,6 +384,8 @@ def fetch_symbol_config_from_api(symbol, public_api):
         logger.error(f"Failed to fetch symbol config from API for {symbol}: {str(e)}")
         raise
 
+import math
+
 def adjust_quantity(quantity, symbol_config, price):
     contract_size = symbol_config['contractSize']  # 0.01 XRP per contract
     lot_size = symbol_config.get('lotSize', 0.01)  # 0.01
@@ -393,22 +395,22 @@ def adjust_quantity(quantity, symbol_config, price):
 
     # Calculate contracts (quantity in XRP / contract size)
     contracts = quantity / contract_size  # e.g., 100 / 0.01 = 10,000
-    contracts /= 100  # Adjust for OKX's 100x scaling
-    logger.debug(f"Initial contracts: {contracts:.2f}")
+    contracts /= 10000  # Adjust for OKX's 100x * 100x scaling
+    logger.debug(f"Initial contracts: {contracts:.4f}")
 
     # Ensure compliance with lot size and minimum notional
     min_qty_notional = max(min_qty, min_notional / price / contract_size)  # e.g., max(0.01, 0.01 / 2.177 / 0.01 ≈ 0.459)
-    lots = contracts / lot_size  # e.g., 100 / 0.01 = 10,000
-    rounded_lots = round(max(lots, min_qty_notional / lot_size))
-    adjusted_contracts = round(rounded_lots * lot_size, precision)  # e.g., 10,000 * 0.01 = 100.00
+    lots = contracts / lot_size  # e.g., 0.1 / 0.01 = 10
+    rounded_lots = math.floor(max(lots, min_qty_notional / lot_size))  # e.g., floor(10) = 10
+    adjusted_contracts = round(rounded_lots * lot_size, precision)  # e.g., 10 * 0.01 = 0.10
 
     # Ensure multiple of lot size
-    adjusted_contracts = round(adjusted_contracts / lot_size) * lot_size
+    adjusted_contracts = math.floor(adjusted_contracts / lot_size) * lot_size
     if adjusted_contracts < min_qty:
         adjusted_contracts = min_qty
         logger.debug(f"Adjusted to minQty: {adjusted_contracts:.2f} contracts")
 
-    effective_size = adjusted_contracts * contract_size * 100  # Reflect OKX's scaling
+    effective_size = adjusted_contracts * contract_size * 10000  # Reflect OKX's scaling
     logger.debug(f"Adjusted quantity: {adjusted_contracts:.2f} contracts (effective {effective_size:.2f} XRP)")
     return adjusted_contracts
 
@@ -596,7 +598,6 @@ def place_limit_orders(trend, st_line, run_id, symbol_config):
             db_conn.commit()
 
         pending_orders = []
-        # Define base_price, price_range, and side
         if trend == 1:
             base_price = st_line * (1 + min_range)
             price_range = st_line * (max_range - min_range)
@@ -608,13 +609,15 @@ def place_limit_orders(trend, st_line, run_id, symbol_config):
 
         orders = []
         total_contracts = 0
+        total_margin = 0
         for i in range(ORDERS_PER_TRADE):
             price = base_price + (i / (ORDERS_PER_TRADE - 1)) * price_range if ORDERS_PER_TRADE > 1 else base_price
-            size = base_size * (1 + random.uniform(-0.1, 0.1))  # e.g., ~90–110 XRP
+            size = base_size * (1 + random.uniform(-0.1, 0.1))
             price = adjust_price(price, symbol_config)
-            contract_size = adjust_quantity(size, symbol_config, price)  # e.g., ~90–110 contracts
-            total_contracts += contract_size
-            logger.debug(f"Preparing order: {side} at {price:.4f} with size {contract_size:.2f} contracts ({contract_size * symbol_config['contractSize'] * 100:.2f} XRP)")
+            contract_size = adjust_quantity(size, symbol_config, price)
+            order_margin = (contract_size * symbol_config['contractSize'] * 10000 * price) / 10  # 10x leverage
+            total_margin += order_margin
+            logger.debug(f"Preparing order: {side} at {price:.4f} with size {contract_size:.2f} contracts ({contract_size * symbol_config['contractSize'] * 10000:.2f} XRP, Margin {order_margin:.2f} USDT)")
             orders.append({
                 'instId': OKX_TRADING_PAIR,
                 'tdMode': 'isolated',
@@ -625,21 +628,23 @@ def place_limit_orders(trend, st_line, run_id, symbol_config):
             })
             pending_orders.append({
                 'price': price,
-                'size': contract_size * symbol_config['contractSize'] * 100,
+                'size': contract_size * symbol_config['contractSize'] * 10000,
                 'side': side,
                 'position_id': None
             })
+            total_contracts += contract_size
 
-        logger.info(f"Total contracts: {total_contracts:.2f} (~{total_contracts * symbol_config['contractSize'] * 100:.2f} XRP)")
+        logger.info(f"Total contracts: {total_contracts:.2f} (~{total_contracts * symbol_config['contractSize'] * 10000:.2f} XRP, Total Margin {total_margin:.2f} USDT)")
         batch_result = okx_trade_api.place_multiple_orders(orders)
         placed_count = 0
         if batch_result['code'] != "0":
             logger.error(f"Failed to place limit orders: {batch_result['msg']}")
-            for order_data in batch_result['data']:
+            for order_data, order in zip(batch_result['data'], orders):
                 if order_data['sCode'] != "0":
                     px = order_data.get('px', 'N/A')
                     sz = order_data.get('sz', 'N/A')
                     logger.error(f"Order failed: {order_data['sMsg']} (Price: {px}, Size: {sz})")
+                    pending_orders = [o for o in pending_orders if o['price'] != float(order_data.get('px', 0))]
                 else:
                     placed_count += 1
             log_error("PlaceOrderError", f"Failed to place limit orders: {batch_result['msg']}", "place_limit_orders")
@@ -663,7 +668,7 @@ def place_limit_orders(trend, st_line, run_id, symbol_config):
                 order_id = order_data['ordId']
                 c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id, run_id)
                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                          (1, order_id, order['side'], float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'] * 100,
+                          (1, order_id, order['side'], float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'] * 10000,
                            'pending', str(datetime.now(timezone.utc)), None, run_id))
                 placed_count += 1
             db_conn.commit()
@@ -676,7 +681,7 @@ def place_tp_orders(fill_data, run_id, symbol_config):
     try:
         with db_lock:
             c = db_conn.cursor()
-            fill_size = fill_data['size'] / symbol_config['contractSize'] / 100  # e.g., 0.01 / 0.01 / 100 = 1 contract
+            fill_size = fill_data['size'] / symbol_config['contractSize'] / 10000  # e.g., 90.01 / 0.01 / 10000 = 0.9001 contracts
             fill_price = fill_data['price']
             side = 'sell' if fill_data['side'] == 'buy' else 'buy'
             position_id = fill_data.get('position_id')
@@ -685,7 +690,7 @@ def place_tp_orders(fill_data, run_id, symbol_config):
                 tp_percentages = [float(p) for p in TP_PERCENTAGES.split(',')]
             else:
                 tp_percentages = [float(p) for p in TP_PERCENTAGES]
-            tp_size = fill_size / len(tp_percentages)  # e.g., 1 / 5 = 0.2 contracts
+            tp_size = fill_size / len(tp_percentages)  # e.g., 0.9001 / 5 = 0.18002 contracts
             min_qty = symbol_config['minQty']  # 0.01 contracts
             min_notional = symbol_config['minNotional']  # 0.01 USDT
 
@@ -693,11 +698,11 @@ def place_tp_orders(fill_data, run_id, symbol_config):
             for i, percentage in enumerate(tp_percentages):
                 tp_price = fill_price * (1 + percentage / 100) if fill_data['side'] == 'buy' else fill_price * (1 - percentage / 100)
                 tp_price = adjust_price(tp_price, symbol_config)
-                tp_contract_size = adjust_quantity(tp_size * symbol_config['contractSize'] * 100, symbol_config, tp_price)  # e.g., 0.2 * 0.01 * 100 = 0.2 XRP
+                tp_contract_size = adjust_quantity(tp_size * symbol_config['contractSize'] * 10000, symbol_config, tp_price)  # e.g., 0.18002 * 0.01 * 10000 = 18.002 XRP
                 if tp_contract_size < min_qty:
                     logger.debug(f"TP order size {tp_contract_size:.2f} contracts below minQty {min_qty}, adjusting")
                     tp_contract_size = min_qty
-                tp_asset_size = tp_contract_size * symbol_config['contractSize'] * 100  # e.g., 0.01 * 0.01 * 100 = 0.1 XRP
+                tp_asset_size = tp_contract_size * symbol_config['contractSize'] * 10000
                 if tp_asset_size * tp_price < min_notional:
                     logger.warning(f"TP order notional {tp_asset_size * tp_price:.4f} USDT below minNotional {min_notional}, skipping")
                     continue
@@ -730,7 +735,7 @@ def place_tp_orders(fill_data, run_id, symbol_config):
                 order_id = order_data['ordId']
                 c.execute('''INSERT INTO take_profits (trade_id, tp_level, order_id, price, size, status, timestamp, position_id, run_id)
                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                          (1, placed_count + 1, order_id, float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'] * 100,
+                          (1, placed_count + 1, order_id, float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'] * 10000,
                            'pending', str(datetime.now(timezone.utc)), position_id, run_id))
                 placed_count += 1
             db_conn.commit()
