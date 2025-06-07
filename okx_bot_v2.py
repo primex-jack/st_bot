@@ -585,7 +585,7 @@ def place_limit_orders(trend, st_line, run_id, symbol_config):
         with db_lock:
             c = db_conn.cursor()
             balance = okx_account_api.get_account_balance()
-            logger.debug(f"Balance response: {balance}")
+            logger.debug(f"Balance response: {json.dumps(balance, indent=2)}")
             if balance['code'] != "0":
                 logger.error(f"Failed to fetch balance: {balance['msg']}")
                 log_error("BalanceError", balance['msg'], "place_limit_orders")
@@ -601,7 +601,7 @@ def place_limit_orders(trend, st_line, run_id, symbol_config):
 
             try:
                 orders = okx_trade_api.get_order_list(instType="SWAP", instId=OKX_TRADING_PAIR, ordType="limit")
-                logger.debug(f"Open orders: {orders}")
+                logger.debug(f"Open orders: {json.dumps(orders, indent=2)}")
                 if orders['code'] == "0":
                     for order in orders['data']:
                         if order['state'] in ['live', 'partially_filled']:
@@ -667,7 +667,6 @@ def place_limit_orders(trend, st_line, run_id, symbol_config):
                     logger.error(f"Order failed: {order_data.get('sMsg', 'Unknown error')} (Price: {px}, Size: {sz})")
                     pending_orders = [o for o in pending_orders if o['price'] != float(order.get('px', 0))]
                     continue
-                placed_count += 1
 
         with db_lock:
             c = db_conn.cursor()
@@ -699,16 +698,28 @@ def place_tp_orders(fill_data, run_id, symbol_config):
     try:
         with db_lock:
             c = db_conn.cursor()
-            fill_size = fill_data['size']  # e.g., 99 XRP
-            fill_price = fill_data['price']
-            side = 'buy' if fill_data['side'] == 'sell' else 'sell'  # Opposite of fill
+            fill_size = fill_data.get('size', 0)
+            fill_price = fill_data.get('price', 0)
+            side = 'buy' if fill_data['side'] == 'sell' else 'sell'
             position_id = fill_data.get('position_id')
-            logger.info(f"Placing TP order: Fill size {fill_size:.2f} XRP, Price {fill_price:.4f}, Side {side}, Position ID {position_id}")
+            logger.info(f"Starting TP placement: Fill size {fill_size:.2f} XRP, Price {fill_price:.4f}, Side {side}, Position ID {position_id}")
 
-            tp_percentage = 1.0  # 1% TP
-            logger.debug(f"TP percentage: {tp_percentage}%")
+            if fill_size <= 0 or fill_price <= 0:
+                logger.error(f"Invalid fill data: size={fill_size}, price={fill_price}")
+                log_error("InvalidData", f"Invalid fill size or price", "place_tp_orders")
+                return
+
+            if not symbol_config:
+                logger.error("Symbol config is empty")
+                log_error("ConfigError", "Empty symbol config", "place_tp_orders")
+                return
+
+            tp_percentage = 1.0
+            logger.debug(f"Using TP percentage: {tp_percentage}%")
             tp_price = fill_price * (1 - tp_percentage / 100) if fill_data['side'] == 'sell' else fill_price * (1 + tp_percentage / 100)
             tp_price = adjust_price(tp_price, symbol_config)
+            logger.debug(f"Calculated TP price: {tp_price:.4f}")
+
             tp_contract_size = adjust_quantity(fill_size, symbol_config, tp_price)
             min_qty = symbol_config.get('minQty', 0.01)
             min_notional = symbol_config.get('minNotional', 0.01)
@@ -718,8 +729,9 @@ def place_tp_orders(fill_data, run_id, symbol_config):
             tp_asset_size = tp_contract_size * symbol_config['contractSize'] * 10000
             notional = tp_asset_size * tp_price
             logger.debug(f"TP order: Price {tp_price:.4f}, Size {tp_contract_size:.2f} contracts ({tp_asset_size:.2f} XRP), Notional {notional:.4f} USDT")
+
             if notional < min_notional:
-                logger.error(f"TP order notional {notional:.4f} USDT below min {min_notional}, cannot place order")
+                logger.error(f"TP order notional {notional:.4f} USDT below min {min_notional}")
                 log_error("OrderError", f"TP notional below min: {notional:.4f} USDT", "place_tp_orders")
                 return
 
@@ -743,7 +755,9 @@ def place_tp_orders(fill_data, run_id, symbol_config):
             order_id = result['data'][0].get('ordId')
             if not order_id:
                 logger.error(f"No order ID in TP response: {result}")
+                log_error("ResponseError", f"No order ID in response", "place_tp_orders")
                 return
+
             c.execute('''INSERT INTO take_profits (trade_id, tp_level, order_id, price, size, status, timestamp, position_id, run_id)
                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                       (1, 1, order_id, float(order['px']), float(order['sz']) * symbol_config['contractSize'] * 10000,
@@ -895,7 +909,7 @@ def order_websocket_handler(run_id):
                 with db_lock:
                     c = db_conn.cursor()
                     orders = okx_trade_api.get_orders_history(instType="SWAP", instId=OKX_TRADING_PAIR, ordType="limit", limit=100)
-                    logger.debug(f"Polled orders: {json.dumps(orders, indent=2)}")
+                    logger.info(f"Polled orders: {json.dumps(orders, indent=2)}")
                     if orders['code'] == "0":
                         for order in orders['data']:
                             if order['state'] == 'filled':
@@ -914,11 +928,11 @@ def order_websocket_handler(run_id):
                                     redis_client.rpush(f"bot_{BOT_INSTANCE_ID}_fill_queue", json.dumps(fill_data))
                                     logger.info(f"Polled fill event: {fill_data}")
                     db_conn.commit()
-                time.sleep(30)
+                time.sleep(10)  # Increase polling frequency
             except Exception as e:
                 logger.error(f"Order polling error: {str(e)}", exc_info=True)
                 log_error("PollingError", str(e), "order_polling")
-                time.sleep(30)
+                time.sleep(10)
 
     threading.Thread(target=poll_orders, daemon=True).start()
     ws = websocket.WebSocketApp(
