@@ -26,8 +26,9 @@ from okx.PublicData import PublicAPI
 # Initialize colorama
 init()
 
+
 # Script Version
-SCRIPT_VERSION = "2.0.19"
+SCRIPT_VERSION = "2.0.20"
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -160,66 +161,50 @@ okx_public_api = PublicAPI(flag="0", debug=False)
 # File paths
 SYMBOL_CONFIG_FILE = 'symbol_configs.json'
 
+# Global database connection and lock
+db_lock = threading.Lock()
+db_conn = None
+
 # Database initialization
 def init_db():
-    global current_position, pending_orders
-    conn = sqlite3.connect('trade_history_v2.db', timeout=20)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT,
-                    trading_pair TEXT,
-                    timeframe TEXT,
-                    side TEXT,
-                    entry_price REAL,
-                    size REAL,
-                    exit_price REAL,
-                    stop_loss REAL,
-                    profit_loss REAL,
-                    trend REAL,
-                    order_id TEXT,
-                    stop_loss_order_id TEXT,
-                    position_id TEXT
+    global db_conn, current_position, pending_orders
+    db_conn = sqlite3.connect('trade_db_v2.db', timeout=30, check_same_thread=False)
+    db_conn.execute('PRAGMA journal_mode=WAL;')  # Enable WAL mode for better concurrency
+    c = db_conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS trades
+                 (
+                     .
+                     .
+                     .
                  )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS orders (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    trade_id INTEGER,
-                    order_id TEXT,
-                    side TEXT,
-                    price REAL,
-                    size REAL,
-                    status TEXT,
-                    timestamp TEXT,
-                    position_id TEXT,
-                    run_id INTEGER
+    c.execute('''CREATE TABLE IF NOT EXISTS orders
+                 (
+                     .
+                     .
+                     .
                  )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS take_profits (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    trade_id INTEGER,
-                    tp_level INTEGER,
-                    order_id TEXT,
-                    price REAL,
-                    size REAL,
-                    status TEXT,
-                    timestamp TEXT,
-                    position_id TEXT,
-                    run_id INTEGER
+    c.execute('''CREATE TABLE IF NOT EXISTS take_profits
+                 (
+                     .
+                     .
+                     .
                  )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS errors (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT,
-                    error_message TEXT,
-                    context TEXT
+    c.execute('''CREATE TABLE IF NOT EXISTS errors
+                 (
+                     .
+                     .
+                     .
                  )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS bot_runs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    start_time TEXT,
-                    end_time TEXT
+    c.execute('''CREATE TABLE IF NOT EXISTS bot_runs
+                 (
+                     .
+                     .
+                     .
                  )''')
     start_time = str(datetime.now(timezone.utc))
     c.execute("INSERT INTO bot_runs (start_time) VALUES (?)", (start_time,))
     run_id = c.lastrowid
-    conn.commit()
+    db_conn.commit()
 
     c.execute("DELETE FROM orders WHERE status = 'pending'")
     c.execute("DELETE FROM take_profits")
@@ -320,23 +305,20 @@ def init_db():
             conn.commit()
     else:
         logger.info("No open position, skipping historical order sync")
-    return conn
+    return run_id  # Return run_id instead of connection
 
-@retry(wait=wait_fixed(1), stop=stop_after_attempt(20))
-def log_error(error_message, context):
-    try:
-        conn = sqlite3.connect('trade_history_v2.db', timeout=30)
-        c = conn.cursor()
-        c.execute('''INSERT INTO errors (timestamp, error_message, context)
-                     VALUES (?, ?, ?)''',
-                  (str(datetime.now(timezone.utc)), error_message, context))
-        conn.commit()
-        conn.close()
-    except sqlite3.OperationalError as e:
-        logger.error(f"Database error during log_error: {str(e)}")
-        raise
-    except Exception as e:
-        logger.error(f"Failed to log error: {str(e)}")
+#@retry(wait=wait_fixed(1), stop=stop_after_attempt(5))
+def log_error(error_type, error_message, context):
+    with db_lock:
+        try:
+            c = db_conn.cursor()
+            c.execute('''INSERT INTO errors (timestamp, error_type, error_message, context)
+                         VALUES (?, ?, ?, ?)''',
+                      (str(datetime.now(timezone.utc)), error_type, error_message, context))
+            db_conn.commit()
+        except sqlite3.OperationalError as e:
+            logger.error(f"Database error during log_error: {str(e)}")
+            raise
 
 def load_symbol_config(symbol, public_api):
     try:
@@ -384,28 +366,27 @@ def adjust_quantity(quantity, symbol_config, price):
     contract_size = symbol_config['contractSize']  # e.g., 0.01 XRP per contract
     lot_size = symbol_config.get('lotSize', 0.01)  # e.g., 0.01
     precision = symbol_config['quantityPrecision']  # e.g., 2
-    min_qty = symbol_config['minQty']  # e.g., 0.01
+    min_qty = symbol_config['minQty']  # e.g., 0.01 contracts
     min_notional = symbol_config['minNotional']  # e.g., 0.01 USDT
 
     # Calculate contracts (quantity in XRP / contract size)
-    contracts = quantity / contract_size  # e.g., 0.01 XRP / 0.01 = 1 contract
-    logger.debug(f"Initial contracts: {contracts:.4f}")
+    contracts = quantity / contract_size  # e.g., 100 / 0.01 = 10,000
+    logger.debug(f"Initial contracts: {contracts:.2f}")
 
     # Ensure compliance with lot size and minimum notional
-    min_qty_notional = max(min_qty, min_notional / price / contract_size)  # e.g., max(0.01, 0.01 / 2.177 / 0.01)
-    lots = contracts / lot_size  # e.g., 1 / 0.01 = 100 lots
-    rounded_lots = round(max(lots, min_qty_notional / lot_size) / lot_size) * lot_size  # e.g., round(100 / 0.01) * 0.01 = 100
-    adjusted_contracts = round(rounded_lots * lot_size, precision)  # e.g., round(100 * 0.01, 2) = 100.00
+    min_qty_notional = max(min_qty, min_notional / price / contract_size)  # e.g., max(0.01, 0.01 / 2.177 / 0.01 ≈ 0.459)
+    lots = contracts / lot_size  # e.g., 10,000 / 0.01 = 1,000,000
+    rounded_lots = round(max(lots, min_qty_notional / lot_size))
+    adjusted_contracts = round(rounded_lots * lot_size, precision)  # e.g., 1,000,000 * 0.01 = 10,000.00
 
     # Ensure multiple of lot size
     adjusted_contracts = round(adjusted_contracts / lot_size) * lot_size
     if adjusted_contracts < min_qty:
         adjusted_contracts = min_qty
-        logger.debug(f"Adjusted quantity increased to meet minQty: {adjusted_contracts:.2f} contracts")
+        logger.debug(f"Adjusted to minQty: {adjusted_contracts:.2f} contracts")
 
-    # Verify effective size
-    effective_size = adjusted_contracts * contract_size  # e.g., 100 * 0.01 = 1 XRP
-    logger.debug(f"Adjusted quantity: {adjusted_contracts:.2f} contracts (effective {effective_size:.4f} XRP)")
+    effective_size = adjusted_contracts * contract_size  # e.g., 10,000 * 0.01 = 100 XRP
+    logger.debug(f"Adjusted quantity: {adjusted_contracts:.2f} contracts (effective {effective_size:.2f} XRP)")
     return adjusted_contracts  # Returns contracts
 
 def adjust_price(price, symbol_config):
@@ -555,45 +536,43 @@ def update_stop_loss(trade_api, symbol, side, new_stop_price, current_stop_order
         logger.error(f"Failed to update stop-loss: {str(e)}")
         raise
 
-def place_limit_orders(trend, st_line, conn, symbol_config):
+def place_limit_orders(trend, st_line, run_id, symbol_config):
     global pending_orders
     min_range, max_range = ORDERS_RANGE[1] / 100, ORDERS_RANGE[0] / 100
-    base_size = POSITION_SIZE / ORDERS_PER_TRADE
+    base_size = POSITION_SIZE / ORDERS_PER_TRADE  # e.g., 1000 / 10 = 100 XRP
 
     try:
-        db_conn = sqlite3.connect('trade_history_v2.db', timeout=20)
-        c = db_conn.cursor()
-        c.execute("SELECT id FROM bot_runs ORDER BY id DESC LIMIT 1")
-        run_id = c.fetchone()[0]
+        with db_lock:
+            c = db_conn.cursor()
+            balance = okx_account_api.get_account_balance()
+            if balance['code'] != "0":
+                logger.error(f"Failed to fetch balance: {balance['msg']}")
+                log_error("BalanceError", balance['msg'], "place_limit_orders")
+                return
+            available_usdt = float(next((bal['availBal'] for bal in balance['data'][0]['details'] if bal['ccy'] == 'USDT'), 0))
+            frozen_usdt = float(next((bal['frozenBal'] for bal in balance['data'][0]['details'] if bal['ccy'] == 'USDT'), 0))
+            required_margin = (POSITION_SIZE * st_line) / 10  # 10x leverage
+            logger.debug(f"Margin check: Available {available_usdt:.2f} USDT, Frozen {frozen_usdt:.2f} USDT, Required {required_margin:.2f} USDT")
+            if available_usdt < required_margin:
+                logger.error(f"Insufficient margin: Available {available_usdt:.2f} USDT, Frozen {frozen_usdt:.2f} USDT, Required {required_margin:.2f} USDT")
+                log_error("MarginError", f"Insufficient margin: Available {available_usdt:.2f} USDT", "place_limit_orders")
+                return
 
-        balance = okx_account_api.get_account_balance()
-        if balance['code'] != "0":
-            logger.error(f"Failed to fetch balance: {balance['msg']}")
-            log_error(f"Failed to fetch balance: {balance['msg']}", "place_limit_orders")
-            return
-        available_usdt = float(next((bal['availBal'] for bal in balance['data'][0]['details'] if bal['ccy'] == 'USDT'), 0))
-        frozen_usdt = float(next((bal['frozenBal'] for bal in balance['data'][0]['details'] if bal['ccy'] == 'USDT'), 0))
-        required_margin = (POSITION_SIZE * st_line) / 10  # 10x leverage
-        logger.debug(f"Margin check: Available {available_usdt:.2f} USDT, Frozen {frozen_usdt:.2f} USDT, Required {required_margin:.2f} USDT")
-        if available_usdt < required_margin:
-            logger.error(f"Insufficient margin: Available {available_usdt:.2f} USDT, Frozen {frozen_usdt:.2f} USDT, Required {required_margin:.2f} USDT")
-            log_error(f"Insufficient margin: Available {available_usdt:.2f} USDT, Frozen {frozen_usdt:.2f} USDT, Required {required_margin:.2f} USDT", "place_limit_orders")
-            return
+            try:
+                orders = okx_trade_api.get_order_list(instType="SWAP", instId=OKX_TRADING_PAIR, ordType="limit")
+                if orders['code'] == "0":
+                    for order in orders['data']:
+                        if order['state'] in ['live', 'partially_filled']:
+                            okx_trade_api.cancel_order(instId=OKX_TRADING_PAIR, ordId=order['ordId'])
+                            logger.debug(f"Canceled existing order ID: {order['ordId']}")
+            except Exception as e:
+                logger.error(f"Failed to cancel existing orders: {str(e)}")
+                log_error("CancelError", str(e), "place_limit_orders")
 
-        try:
-            orders = okx_trade_api.get_order_list(instType="SWAP", instId=OKX_TRADING_PAIR, ordType="limit")
-            if orders['code'] == "0":
-                for order in orders['data']:
-                    if order['state'] in ['live', 'partially_filled']:
-                        okx_trade_api.cancel_order(instId=OKX_TRADING_PAIR, ordId=order['ordId'])
-                        logger.debug(f"Canceled existing order ID: {order['ordId']}")
-        except Exception as e:
-            logger.error(f"Failed to cancel existing orders: {str(e)}")
-            log_error(str(e), "place_limit_orders")
+            c.execute("UPDATE orders SET status = 'cancelled' WHERE status = 'pending'")
+            db_conn.commit()
 
-        c.execute("UPDATE orders SET status = 'cancelled' WHERE status = 'pending'")
         pending_orders = []
-
         if trend == 1:
             base_price = st_line * (1 + min_range)
             price_range = st_line * (max_range - min_range)
@@ -607,11 +586,11 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
         total_contracts = 0
         for i in range(ORDERS_PER_TRADE):
             price = base_price + (i / (ORDERS_PER_TRADE - 1)) * price_range if ORDERS_PER_TRADE > 1 else base_price
-            size = base_size * (1 + random.uniform(-0.1, 0.1))
+            size = base_size * (1 + random.uniform(-0.1, 0.1))  # e.g., ~90–110 XRP
             price = adjust_price(price, symbol_config)
-            contract_size = adjust_quantity(size, symbol_config, price)
+            contract_size = adjust_quantity(size, symbol_config, price)  # e.g., ~9,000–11,000 contracts
             total_contracts += contract_size
-            logger.debug(f"Preparing order: {side} at {price:.4f} with size {contract_size:.2f} contracts ({contract_size * symbol_config['contractSize']:.4f} XRP)")
+            logger.debug(f"Preparing order: {side} at {price:.4f} with size {contract_size:.2f} contracts ({contract_size * symbol_config['contractSize']:.2f} XRP)")
             orders.append({
                 'instId': OKX_TRADING_PAIR,
                 'tdMode': 'isolated',
@@ -627,118 +606,117 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
                 'position_id': None
             })
 
-        logger.debug(f"Total contracts: {total_contracts:.2f} (~{total_contracts * symbol_config['contractSize']:.4f} XRP)")
+        logger.info(f"Total contracts: {total_contracts:.2f} (~{total_contracts * symbol_config['contractSize']:.2f} XRP)")
         batch_result = okx_trade_api.place_multiple_orders(orders)
         placed_count = 0
         if batch_result['code'] != "0":
             logger.error(f"Failed to place limit orders: {batch_result['msg']}")
             for order_data in batch_result['data']:
                 if order_data['sCode'] != "0":
-                    logger.error(f"Order failed: {order_data['sMsg']} (Price: {order_data.get('px')}, Size: {order_data.get('sz')})")
+                    px = order_data.get('px', 'N/A')
+                    sz = order_data.get('sz', 'N/A')
+                    logger.error(f"Order failed: {order_data['sMsg']} (Price: {px}, Size: {sz})")
                 else:
                     placed_count += 1
-            log_error(f"Failed to place limit orders: {batch_result['msg']} - Details: {batch_result['data']}", "place_limit_orders")
+            log_error("PlaceOrderError", f"Failed to place limit orders: {batch_result['msg']}", "place_limit_orders")
             if placed_count == 0:
                 pending_orders = []
-                c.execute("DELETE FROM orders WHERE status = 'pending'")
-            db_conn.commit()
+                with db_lock:
+                    c.execute("DELETE FROM orders WHERE status = 'pending'")
+                    db_conn.commit()
             logger.info(f"Placed {placed_count} limit orders for trend {trend}")
             return
 
-        c = db_conn.cursor()
-        for order_data, order in zip(batch_result['data'], orders):
-            if order_data['sCode'] != "0":
-                logger.error(f"Order failed: {order_data['sMsg']} (Price: {order_data.get('px')}, Size: {order_data.get('sz')})")
-                pending_orders = [o for o in pending_orders if o['price'] != float(order_data.get('px', 0))]
-                continue
-            order_id = order_data['ordId']
-            c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id, run_id)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                      (1, order_id, order['side'], float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'],
-                       'pending', str(datetime.now(timezone.utc)), None, run_id))
-            placed_count += 1
-        db_conn.commit()
+        with db_lock:
+            c = db_conn.cursor()
+            for order_data, order in zip(batch_result['data'], orders):
+                if order_data['sCode'] != "0":
+                    px = order_data.get('px', 'N/A')
+                    sz = order_data.get('sz', 'N/A')
+                    logger.error(f"Order failed: {order_data['sMsg']} (Price: {px}, Size: {sz})")
+                    pending_orders = [o for o in pending_orders if o['price'] != float(order_data.get('px', 0))]
+                    continue
+                order_id = order_data['ordId']
+                c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id, run_id)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                          (1, order_id, order['side'], float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'],
+                           'pending', str(datetime.now(timezone.utc)), None, run_id))
+                placed_count += 1
+            db_conn.commit()
         logger.info(f"Placed {placed_count} limit orders for trend {trend}")
     except Exception as e:
         logger.error(f"Error in place_limit_orders: {str(e)}")
-        log_error(str(e), "place_limit_orders")
-    finally:
-        if 'db_conn' in locals():
-            db_conn.close()
+        log_error("GeneralError", str(e), "place_limit_orders")
 
-def place_tp_orders(fill_data, conn, symbol_config):
+def place_tp_orders(fill_data, run_id, symbol_config):
     try:
-        db_conn = sqlite3.connect('trade_history_v2.db', timeout=20)
-        c = db_conn.cursor()
-        c.execute("SELECT id FROM bot_runs ORDER BY id DESC LIMIT 1")
-        run_id = c.fetchone()[0]
+        with db_lock:
+            c = db_conn.cursor()
+            fill_size = fill_data['size'] / symbol_config['contractSize']  # Convert XRP to contracts, e.g., 0.0096 / 0.01 = 0.96
+            fill_price = fill_data['price']
+            side = 'sell' if fill_data['side'] == 'buy' else 'buy'
+            position_id = fill_data.get('position_id')
 
-        fill_size = fill_data['size']  # Asset units
-        fill_price = fill_data['price']
-        side = 'sell' if fill_data['side'] == 'buy' else 'buy'
-        position_id = fill_data.get('position_id')
+            if isinstance(TP_PERCENTAGES, str):
+                tp_percentages = [float(p) for p in TP_PERCENTAGES.split(',')]
+            else:
+                tp_percentages = [float(p) for p in TP_PERCENTAGES]
+            tp_size = fill_size / len(tp_percentages)  # e.g., 0.96 / 5 = 0.192 contracts
+            min_qty = symbol_config['minQty']  # 0.01 contracts
+            min_notional = symbol_config['minNotional']  # 0.01 USDT
 
-        if isinstance(TP_PERCENTAGES, str):
-            tp_percentages = [float(p) for p in TP_PERCENTAGES.split(',')]
-        else:
-            tp_percentages = [float(p) for p in TP_PERCENTAGES]
-        tp_size = fill_size / len(tp_percentages)
-        min_qty = symbol_config['minQty'] * symbol_config['contractSize']
-        min_notional = symbol_config['minNotional']
+            orders = []
+            for i, percentage in enumerate(tp_percentages):
+                tp_price = fill_price * (1 + percentage / 100) if fill_data['side'] == 'buy' else fill_price * (1 - percentage / 100)
+                tp_price = adjust_price(tp_price, symbol_config)
+                tp_contract_size = adjust_quantity(tp_size * symbol_config['contractSize'], symbol_config, tp_price)  # Convert back to XRP for adjust_quantity
+                if tp_contract_size < min_qty:
+                    logger.debug(f"TP order size {tp_contract_size:.2f} contracts below minQty {min_qty}, adjusting")
+                    tp_contract_size = min_qty
+                tp_asset_size = tp_contract_size * symbol_config['contractSize']  # e.g., 0.01 * 0.01 = 0.0001 XRP
+                if tp_asset_size * tp_price < min_notional:
+                    logger.warning(f"TP order notional {tp_asset_size * tp_price:.4f} USDT below minNotional {min_notional}, skipping")
+                    continue
+                logger.debug(f"Preparing TP order: {side} at {tp_price:.4f} with size {tp_contract_size:.2f} contracts ({tp_asset_size:.4f} XRP)")
+                orders.append({
+                    'instId': OKX_TRADING_PAIR,
+                    'tdMode': 'isolated',
+                    'side': side,
+                    'ordType': 'limit',
+                    'px': str(tp_price),
+                    'sz': str(tp_contract_size),
+                    'reduceOnly': 'true'
+                })
 
-        orders = []
-        for i, percentage in enumerate(tp_percentages):
-            tp_price = fill_price * (1 + percentage / 100) if fill_data['side'] == 'buy' else fill_price * (1 - percentage / 100)
-            tp_price = adjust_price(tp_price, symbol_config)
-            tp_contract_size = adjust_quantity(tp_size, symbol_config, tp_price)  # Returns contracts
-            tp_asset_size = tp_contract_size * symbol_config['contractSize']
-            if tp_asset_size * tp_price < min_notional or tp_asset_size < min_qty:
-                logger.warning(f"TP order size {tp_asset_size:.4f} at {tp_price:.4f} below minQty or minNotional, skipping")
-                continue
-            logger.debug(f"Preparing TP order: {side} at {tp_price:.4f} with size {tp_contract_size:.2f} contracts ({tp_asset_size:.4f} XRP)")
-            orders.append({
-                'instId': OKX_TRADING_PAIR,
-                'tdMode': 'isolated',
-                'side': side,
-                'ordType': 'limit',
-                'px': str(tp_price),
-                'sz': str(tp_contract_size),
-                'reduceOnly': 'true'
-            })
+            if not orders:
+                logger.warning("No valid TP orders to place")
+                return
 
-        if not orders:
-            logger.warning("No valid TP orders to place")
-            return
+            batch_result = okx_trade_api.place_multiple_orders(orders)
+            placed_count = 0
+            if batch_result['code'] != "0":
+                logger.error(f"Failed to place TP orders: {batch_result['msg']}")
+                log_error("PlaceTPError", batch_result['msg'], "place_tp_orders")
+                return
 
-        batch_result = okx_trade_api.place_multiple_orders(orders)
-        placed_count = 0
-        if batch_result['code'] != "0":
-            logger.error(f"Failed to place TP orders: {batch_result['msg']}")
-            log_error(f"Failed to place TP orders: {batch_result['msg']}", "place_tp_orders")
-            return
-
-        c = db_conn.cursor()
-        for order_data, order in zip(batch_result['data'], orders):
-            if order_data['sCode'] != "0":
-                logger.warning(f"TP order failed: {order_data['sMsg']} (Price: {order_data.get('px')}, Size: {order_data.get('sz')})")
-                continue
-            order_id = order_data['ordId']
-            c.execute('''INSERT INTO take_profits (trade_id, tp_level, order_id, price, size, status, timestamp, position_id, run_id)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                      (1, placed_count + 1, order_id, float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'],
-                       'pending', str(datetime.now(timezone.utc)), position_id, run_id))
-            placed_count += 1
-        db_conn.commit()
-        if placed_count > 0:
-            logger.info(f"Placed {placed_count} TP orders for filled order")
-        else:
-            logger.warning("No TP orders placed due to failures")
+            for order_data, order in zip(batch_result['data'], orders):
+                if order_data['sCode'] != "0":
+                    logger.warning(f"TP order failed: {order_data['sMsg']} (Price: {order_data.get('px', 'N/A')}, Size: {order_data.get('sz', 'N/A')})")
+                    continue
+                order_id = order_data['ordId']
+                c.execute('''INSERT INTO take_profits (trade_id, tp_level, order_id, price, size, status, timestamp, position_id, run_id)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                          (1, placed_count + 1, order_id, float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'],
+                           'pending', str(datetime.now(timezone.utc)), position_id, run_id))
+                placed_count += 1
+            db_conn.commit()
+            if placed_count > 0:
+                logger.info(f"Placed {placed_count} TP orders for filled order")
+            else:
+                logger.warning("No TP orders placed due to failures")
     except Exception as e:
         logger.error(f"Error in place_tp_orders: {str(e)}")
-        log_error(str(e), "place_tp_orders")
-    finally:
-        if 'db_conn' in locals():
-            db_conn.close()
+        log_error("GeneralError", str(e), "place_tp_orders")
 
 def refill_position(tp_order, st_line, trend, conn, symbol_config):
     global pending_orders
@@ -918,63 +896,62 @@ def order_websocket_handler(conn):
     ws.run_forever()
 
 @retry(wait=wait_fixed(0.5), stop=stop_after_attempt(10))
-def process_fill_events(symbol_config):
+def process_fill_events(symbol_config, run_id):
     global current_position
     while True:
         try:
             event = redis_client.blpop(f"bot_{BOT_INSTANCE_ID}_fill_queue", timeout=0)
             fill_data = json.loads(event[1])
-            conn = sqlite3.connect('trade_history_v2.db', timeout=20)
-            c = conn.cursor()
-            c.execute("SELECT * FROM orders WHERE order_id = ?", (fill_data['order_id'],))
-            order = c.fetchone()
-            if order and (fill_data.get('position_id') == (current_position.get('position_id') if current_position else None) or fill_data.get('position_id') is None):
-                c.execute("UPDATE orders SET status = 'filled' WHERE order_id = ?", (fill_data['order_id'],))
-                if not current_position or current_position['side'] != ('LONG' if fill_data['side'] == 'buy' else 'SHORT'):
-                    position_id = fill_data.get('position_id') or str(uuid.uuid4())
-                    current_position = {
-                        'side': 'LONG' if fill_data['side'] == 'buy' else 'SHORT',
-                        'entry_price': fill_data['price'],
-                        'size': fill_data['size'],
-                        'open_time': str(datetime.now(timezone.utc)),
-                        'order_id': fill_data['order_id'],
-                        'position_id': position_id
-                    }
-                    logger.info(f"Opened new position: {current_position['side']} at {current_position['entry_price']:.4f}, Size: {current_position['size']:.2f} XRP, Position ID: {position_id}")
-                    c.execute('''INSERT INTO trades (timestamp, trading_pair, timeframe, side, entry_price, size, order_id, position_id)
-                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                              (str(datetime.now(timezone.utc)), TRADING_PAIR, TIMEFRAME, current_position['side'],
-                               current_position['entry_price'], current_position['size'], current_position['order_id'], position_id))
-                    c.execute("UPDATE orders SET position_id = ? WHERE status = 'pending' AND side = ? AND position_id IS NULL",
-                              (position_id, fill_data['side']))
-                else:
-                    old_size = current_position['size']
-                    current_position['size'] += fill_data['size']
-                    current_position['entry_price'] = (
-                        (current_position['entry_price'] * old_size + fill_data['price'] * fill_data['size']) /
-                        current_position['size']
-                    )
-                    logger.info(f"Updated position: {current_position['side']} at {current_position['entry_price']:.4f}, Size: {current_position['size']:.2f} XRP")
-                    c.execute("UPDATE trades SET size = ?, entry_price = ? WHERE position_id = ? AND exit_price IS NULL",
-                              (current_position['size'], current_position['entry_price'], current_position['position_id']))
-                place_tp_orders(fill_data, conn, symbol_config)
-                stop_loss = latest_st_line - STOP_LOSS_OFFSET if latest_trend == 1 else latest_st_line + STOP_LOSS_OFFSET
-                if stop_loss:
-                    stop_loss_order_id = update_stop_loss(
-                        okx_trade_api, OKX_TRADING_PAIR, current_position['side'],
-                        adjust_price(stop_loss, symbol_config), current_position.get('stop_loss_order_id'),
-                        fill_data['price'], current_position['size'], okx_public_api)
-                    if stop_loss_order_id:
-                        logger.info(f"Placed stop-loss order ID: {stop_loss_order_id} at {stop_loss:.4f}")
-                        current_position['stop_loss'] = stop_loss
-                        current_position['stop_loss_order_id'] = stop_loss_order_id
-                        c.execute("UPDATE trades SET stop_loss = ?, stop_loss_order_id = ? WHERE position_id = ?",
-                                  (stop_loss, stop_loss_order_id, current_position['position_id']))
-            conn.commit()
-            conn.close()
+            with db_lock:
+                c = db_conn.cursor()
+                c.execute("SELECT * FROM orders WHERE order_id = ?", (fill_data['order_id'],))
+                order = c.fetchone()
+                if order and (fill_data.get('position_id') == (current_position.get('position_id') if current_position else None) or fill_data.get('position_id') is None):
+                    c.execute("UPDATE orders SET status = 'filled' WHERE order_id = ?", (fill_data['order_id'],))
+                    if not current_position or current_position['side'] != ('LONG' if fill_data['side'] == 'buy' else 'SHORT'):
+                        position_id = fill_data.get('position_id') or str(uuid.uuid4())
+                        current_position = {
+                            'side': 'LONG' if fill_data['side'] == 'buy' else 'SHORT',
+                            'entry_price': fill_data['price'],
+                            'size': fill_data['size'],  # Already in XRP
+                            'open_time': str(datetime.now(timezone.utc)),
+                            'order_id': fill_data['order_id'],
+                            'position_id': position_id
+                        }
+                        logger.info(f"Opened new position: {current_position['side']} at {current_position['entry_price']:.4f}, Size: {current_position['size']:.2f} XRP, Position ID: {position_id}")
+                        c.execute('''INSERT INTO trades (timestamp, trading_pair, timeframe, side, entry_price, size, order_id, position_id)
+                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                                  (str(datetime.now(timezone.utc)), TRADING_PAIR, TIMEFRAME, current_position['side'],
+                                   current_position['entry_price'], current_position['size'], current_position['order_id'], position_id))
+                        c.execute("UPDATE orders SET position_id = ? WHERE status = 'pending' AND side = ? AND position_id IS NULL",
+                                  (position_id, fill_data['side']))
+                    else:
+                        old_size = current_position['size']
+                        current_position['size'] += fill_data['size']
+                        current_position['entry_price'] = (
+                            (current_position['entry_price'] * old_size + fill_data['price'] * fill_data['size']) /
+                            current_position['size']
+                        )
+                        logger.info(f"Updated position: {current_position['side']} at {current_position['entry_price']:.4f}, Size: {current_position['size']:.2f} XRP")
+                        c.execute("UPDATE trades SET size = ?, entry_price = ? WHERE position_id = ? AND exit_price IS NULL",
+                                  (current_position['size'], current_position['entry_price'], current_position['position_id']))
+                    place_tp_orders(fill_data, run_id, symbol_config)
+                    stop_loss = latest_st_line - STOP_LOSS_OFFSET if latest_trend == 1 else latest_st_line + STOP_LOSS_OFFSET
+                    if stop_loss:
+                        stop_loss_order_id = update_stop_loss(
+                            okx_trade_api, OKX_TRADING_PAIR, current_position['side'],
+                            adjust_price(stop_loss, symbol_config), current_position.get('stop_loss_order_id'),
+                            fill_data['price'], current_position['size'], okx_public_api)
+                        if stop_loss_order_id:
+                            logger.info(f"Placed stop-loss order ID: {stop_loss_order_id} at {stop_loss:.4f}")
+                            current_position['stop_loss'] = stop_loss
+                            current_position['stop_loss_order_id'] = stop_loss_order_id
+                            c.execute("UPDATE trades SET stop_loss = ?, stop_loss_order_id = ? WHERE position_id = ?",
+                                      (stop_loss, stop_loss_order_id, current_position['position_id']))
+                db_conn.commit()
         except Exception as e:
             logger.error(f"Error processing fill event: {str(e)}")
-            log_error(str(e), "process_fill_events")
+            log_error("FillError", str(e), "process_fill_events")
 
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10))
 def fetch_historical_data(symbol=TRADING_PAIR, interval=TIMEFRAME, limit=1000, end_time=None, num_batches=2):
@@ -1228,27 +1205,24 @@ def reconnect(ws):
             delay = min(delay * 2, 60)
 
 def main():
-    global conn, latest_st_line, latest_trend
+    global db_conn, latest_st_line, latest_trend
     current_pid = os.getpid()
     for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
         if proc.pid != current_pid and 'python' in proc.name().lower() and 'okx_bot_v2.py' in ' '.join(proc.cmdline()):
             logger.error(f"Another instance of okx_bot_v2.py is running (PID {proc.pid}). Exiting.")
             sys.exit(1)
 
-    conn = init_db()
-
-    order_thread = threading.Thread(target=order_websocket_handler, args=(conn,), daemon=True)
+    run_id = init_db()
+    order_thread = threading.Thread(target=order_websocket_handler, args=(run_id,), daemon=True)
     order_thread.start()
-
     symbol_config = load_symbol_config(OKX_TRADING_PAIR, okx_public_api)
-    fill_thread = threading.Thread(target=process_fill_events, args=(symbol_config,), daemon=True)
+    fill_thread = threading.Thread(target=process_fill_events, args=(symbol_config, run_id), daemon=True)
     fill_thread.start()
-
     websocket_url = "wss://fstream.binance.com/stream"
     ws = websocket.WebSocketApp(
         websocket_url,
         on_open=on_open,
-        on_message=on_message,
+        on_message=lambda ws, msg: on_message(ws, msg, run_id),
         on_error=on_error,
         on_close=on_close
     )
@@ -1256,10 +1230,11 @@ def main():
     try:
         ws.run_forever()
     finally:
-        c = conn.cursor()
-        c.execute("UPDATE bot_runs SET end_time = ? WHERE end_time IS NULL", (str(datetime.now(timezone.utc)),))
-        conn.commit()
-        conn.close()
+        with db_lock:
+            c = db_conn.cursor()
+            c.execute("UPDATE bot_runs SET end_time = ? WHERE end_time IS NULL", (str(datetime.now(timezone.utc)),))
+            db_conn.commit()
+        db_conn.close()
 
 if __name__ == "__main__":
     main()
