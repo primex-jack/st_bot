@@ -386,6 +386,8 @@ def fetch_symbol_config_from_api(symbol, public_api):
 
 import math
 
+import math
+
 def adjust_quantity(quantity, symbol_config, price):
     contract_size = symbol_config['contractSize']  # 0.01 XRP per contract
     lot_size = symbol_config.get('lotSize', 0.01)  # 0.01
@@ -399,10 +401,11 @@ def adjust_quantity(quantity, symbol_config, price):
     logger.debug(f"Initial contracts: {contracts:.4f}")
 
     # Ensure compliance with lot size and minimum notional
-    min_qty_notional = max(min_qty, min_notional / price / contract_size)  # e.g., max(0.01, 0.01 / 2.177 / 0.01 ≈ 0.459)
+    min_qty_notional = max(min_qty, min_notional / price / contract_size)  # e.g., max(0.01, 0.01 / 2.176 / 0.01 ≈ 0.459)
     lots = contracts / lot_size  # e.g., 0.1 / 0.01 = 10
     rounded_lots = math.floor(max(lots, min_qty_notional / lot_size))  # e.g., floor(10) = 10
-    adjusted_contracts = round(rounded_lots * lot_size, precision)  # e.g., 10 * 0.01 = 0.10
+    adjusted_contracts = rounded_lots * lot_size  # e.g., 10 * 0.01 = 0.10
+    adjusted_contracts = round(adjusted_contracts, precision)  # Ensure precision
 
     # Ensure multiple of lot size
     adjusted_contracts = math.floor(adjusted_contracts / lot_size) * lot_size
@@ -410,7 +413,7 @@ def adjust_quantity(quantity, symbol_config, price):
         adjusted_contracts = min_qty
         logger.debug(f"Adjusted to minQty: {adjusted_contracts:.2f} contracts")
 
-    effective_size = adjusted_contracts * contract_size * 10000  # Reflect OKX's scaling
+    effective_size = adjusted_contracts * contract_size * 10000
     logger.debug(f"Adjusted quantity: {adjusted_contracts:.2f} contracts (effective {effective_size:.2f} XRP)")
     return adjusted_contracts
 
@@ -424,6 +427,7 @@ def adjust_price(price, symbol_config):
 def sync_position_with_okx(account_api, trade_api, symbol):
     try:
         positions = account_api.get_positions(instType="SWAP", instId=symbol)
+        logger.debug(f"Positions response: {json.dumps(positions, indent=2)}")
         if positions['code'] != "0":
             raise Exception(f"Failed to fetch positions: {positions['msg']}")
         position_data = positions['data']
@@ -436,9 +440,10 @@ def sync_position_with_okx(account_api, trade_api, symbol):
         entry_price = float(position['avgPx'])
         symbol_config = load_symbol_config(symbol, okx_public_api)
         contract_size = symbol_config.get('contractSize', 0.01)
-        size = abs(float(position['pos'])) * contract_size
+        size = abs(float(position['pos'])) * contract_size * 10000  # Scale correctly
 
-        orders = trade_api.get_algo_order_list(instType="SWAP", instId=symbol, ordType="conditional")
+        orders = trade_api.order_algos_list(instType="SWAP", instId=symbol, ordType="conditional")
+        logger.debug(f"Algo orders response: {json.dumps(orders, indent=2)}")
         if orders['code'] != "0":
             raise Exception(f"Failed to fetch algo orders: {orders['msg']}")
         open_orders = orders['data']
@@ -464,7 +469,7 @@ def sync_position_with_okx(account_api, trade_api, symbol):
         logger.info(f"Synced position: {synced_position}")
         return synced_position
     except Exception as e:
-        logger.error(f"Failed to sync position: {str(e)}")
+        logger.error(f"Failed to sync position: {str(e)}", exc_info=True)
         raise
 
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
@@ -694,16 +699,15 @@ def place_tp_orders(fill_data, run_id, symbol_config):
     try:
         with db_lock:
             c = db_conn.cursor()
-            fill_size = fill_data['size']  # e.g., 45 XRP
+            fill_size = fill_data['size']  # e.g., 99 XRP
             fill_price = fill_data['price']
-            side = 'sell' if fill_data['side'] == 'buy' else 'buy'
+            side = 'buy' if fill_data['side'] == 'sell' else 'sell'  # Opposite of fill
             position_id = fill_data.get('position_id')
             logger.info(f"Placing TP order: Fill size {fill_size:.2f} XRP, Price {fill_price:.4f}, Side {side}, Position ID {position_id}")
 
-            # Use a single TP order with same size as fill
-            tp_percentage = 1.0  # Default 1% TP
+            tp_percentage = 1.0  # 1% TP
             logger.debug(f"TP percentage: {tp_percentage}%")
-            tp_price = fill_price * (1 + tp_percentage / 100) if fill_data['side'] == 'buy' else fill_price * (1 - tp_percentage / 100)
+            tp_price = fill_price * (1 - tp_percentage / 100) if fill_data['side'] == 'sell' else fill_price * (1 + tp_percentage / 100)
             tp_price = adjust_price(tp_price, symbol_config)
             tp_contract_size = adjust_quantity(fill_size, symbol_config, tp_price)
             min_qty = symbol_config.get('minQty', 0.01)
@@ -728,7 +732,7 @@ def place_tp_orders(fill_data, run_id, symbol_config):
                 'sz': str(tp_contract_size),
                 'reduceOnly': True
             }
-            logger.info(f"Submitting TP order: {order}")
+            logger.info(f"Submitting TP order: {json.dumps(order, indent=2)}")
             result = okx_trade_api.place_order(**order)
             logger.debug(f"TP order result: {json.dumps(result, indent=2)}")
             if result['code'] != "0":
@@ -840,7 +844,7 @@ def order_websocket_handler(run_id):
                 logger.info(f"WebSocket login response: {data}")
             elif 'data' in data:
                 for order in data['data']:
-                    logger.debug(f"Processing order: {order}")
+                    logger.info(f"Processing WebSocket order: {json.dumps(order, indent=2)}")
                     if order['state'] == 'filled':
                         with db_lock:
                             c = db_conn.cursor()
@@ -852,7 +856,7 @@ def order_websocket_handler(run_id):
                                 'symbol': order['instId'],
                                 'side': order['side'],
                                 'price': float(order['avgPx']),
-                                'size': float(order['accFillSz']) * symbol_config['contractSize'] * 10000,  # Scale correctly
+                                'size': float(order['accFillSz']) * symbol_config['contractSize'] * 10000,
                                 'position_id': position_id
                             }
                             redis_client.rpush(f"bot_{BOT_INSTANCE_ID}_fill_queue", json.dumps(fill_data))
@@ -891,6 +895,7 @@ def order_websocket_handler(run_id):
                 with db_lock:
                     c = db_conn.cursor()
                     orders = okx_trade_api.get_orders_history(instType="SWAP", instId=OKX_TRADING_PAIR, ordType="limit", limit=100)
+                    logger.debug(f"Polled orders: {json.dumps(orders, indent=2)}")
                     if orders['code'] == "0":
                         for order in orders['data']:
                             if order['state'] == 'filled':
@@ -970,26 +975,34 @@ def process_fill_events(symbol_config, run_id):
                         logger.info(f"Updated position: {current_position['side']} at {current_position['entry_price']:.4f}, Size: {current_position['size']:.2f} XRP")
                         c.execute("UPDATE trades SET size = ?, entry_price = ? WHERE position_id = ? AND exit_price IS NULL",
                                   (current_position['size'], current_position['entry_price'], current_position['position_id']))
-                    logger.info(f"Calling place_tp_orders for fill: {fill_data}")
-                    place_tp_orders(fill_data, run_id, symbol_config)
-                    stop_loss = latest_st_line - STOP_LOSS_OFFSET if latest_trend == 1 else latest_st_line + STOP_LOSS_OFFSET if latest_trend == -1 else None
-                    logger.info(f"Calculated SL: {stop_loss:.4f}, latest_st_line={latest_st_line}, latest_trend={latest_trend}")
-                    if stop_loss:
-                        logger.info(f"Calling update_stop_loss for position ID {position_id}")
-                        stop_loss_order_id = update_stop_loss(
-                            okx_trade_api, OKX_TRADING_PAIR, current_position['side'],
-                            adjust_price(stop_loss, symbol_config), current_position.get('stop_loss_order_id'),
-                            fill_data['price'], current_position['size'], okx_public_api)
-                        if stop_loss_order_id:
-                            logger.info(f"Placed stop-loss order ID: {stop_loss_order_id} at {stop_loss:.4f}")
-                            current_position['stop_loss'] = stop_loss
-                            current_position['stop_loss_order_id'] = stop_loss_order_id
-                            c.execute("UPDATE trades SET stop_loss = ?, stop_loss_order_id = ? WHERE position_id = ?",
-                                      (stop_loss, stop_loss_order_id, current_position['position_id']))
+                    try:
+                        logger.info(f"Calling place_tp_orders for fill: {fill_data}")
+                        place_tp_orders(fill_data, run_id, symbol_config)
+                    except Exception as e:
+                        logger.error(f"Failed to place TP orders: {str(e)}", exc_info=True)
+                        log_error("PlaceTPError", str(e), "process_fill_events")
+                    try:
+                        stop_loss = latest_st_line - STOP_LOSS_OFFSET if latest_trend == 1 else latest_st_line + STOP_LOSS_OFFSET if latest_trend == -1 else None
+                        logger.info(f"Calculated SL: {stop_loss:.4f}, latest_st_line={latest_st_line}, latest_trend={latest_trend}")
+                        if stop_loss:
+                            logger.info(f"Calling update_stop_loss for position ID {position_id}")
+                            stop_loss_order_id = update_stop_loss(
+                                okx_trade_api, OKX_TRADING_PAIR, current_position['side'],
+                                adjust_price(stop_loss, symbol_config), current_position.get('stop_loss_order_id'),
+                                fill_data['price'], current_position['size'], okx_public_api)
+                            if stop_loss_order_id:
+                                logger.info(f"Placed stop-loss order ID: {stop_loss_order_id} at {stop_loss:.4f}")
+                                current_position['stop_loss'] = stop_loss
+                                current_position['stop_loss_order_id'] = stop_loss_order_id
+                                c.execute("UPDATE trades SET stop_loss = ?, stop_loss_order_id = ? WHERE position_id = ?",
+                                          (stop_loss, stop_loss_order_id, current_position['position_id']))
+                            else:
+                                logger.error(f"Failed to place SL for position ID {position_id}")
                         else:
-                            logger.error(f"Failed to place SL for position ID {position_id}")
-                    else:
-                        logger.error(f"No valid SL price: latest_st_line={latest_st_line}, latest_trend={latest_trend}")
+                            logger.error(f"No valid SL price: latest_st_line={latest_st_line}, latest_trend={latest_trend}")
+                    except Exception as e:
+                        logger.error(f"Failed to place SL: {str(e)}", exc_info=True)
+                        log_error("PlaceSLError", str(e), "process_fill_events")
                 else:
                     logger.warning(f"Fill event skipped: Position ID mismatch or invalid {fill_data}")
                 db_conn.commit()
