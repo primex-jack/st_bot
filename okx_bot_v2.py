@@ -504,21 +504,21 @@ def update_stop_loss(trade_api, symbol, side, new_stop_price, current_stop_order
     try:
         symbol_config = load_symbol_config(symbol, public_api)
         new_stop_price = adjust_price(new_stop_price, symbol_config)
-        logger.debug(f"Updating SL: Side {side}, New SL {new_stop_price:.4f}, Current Price {current_price:.4f}, Position Size {position_size:.2f} XRP")
+        logger.info(f"Updating SL: Side {side}, New SL {new_stop_price:.4f}, Current Price {current_price:.4f}, Position Size {position_size:.2f} XRP")
 
         if side == 'LONG':
             if new_stop_price >= current_price:
                 new_stop_price = current_price - 0.01
-                logger.debug(f"Adjusted SL for LONG to {new_stop_price:.4f}")
+                logger.warning(f"Adjusted SL for LONG to {new_stop_price:.4f} (was above current price)")
         elif side == 'SHORT':
             if new_stop_price <= current_price:
                 new_stop_price = current_price + 0.01
-                logger.debug(f"Adjusted SL for SHORT to {new_stop_price:.4f}")
+                logger.warning(f"Adjusted SL for SHORT to {new_stop_price:.4f} (was below current price)")
 
         order_side = 'sell' if side == 'LONG' else 'buy'
 
         if current_stop_order_id:
-            logger.debug(f"Modifying stop-loss order ID: {current_stop_order_id}")
+            logger.debug(f"Modifying SL order ID: {current_stop_order_id}")
             amend_result = trade_api.amend_algo_order(
                 instId=symbol,
                 algoId=current_stop_order_id,
@@ -528,19 +528,20 @@ def update_stop_loss(trade_api, symbol, side, new_stop_price, current_stop_order
             logger.debug(f"Amend result: {amend_result}")
             if amend_result['code'] != "0":
                 if "Position does not exist" in amend_result.get('msg', '') or amend_result.get('code') == "51169":
-                    logger.warning(f"No position exists to amend stop-loss for {symbol}")
+                    logger.warning(f"No position exists to amend SL for {symbol}")
                     return None
-                logger.error(f"Failed to amend stop-loss order: {amend_result}")
+                logger.error(f"Failed to amend SL order: {amend_result['msg']}")
                 if not cancel_all_stop_loss_orders(trade_api, symbol):
-                    raise Exception("Failed to cancel stop-loss orders")
+                    raise Exception("Failed to cancel SL orders")
             else:
-                logger.info(f"Modified stop-loss order ID: {current_stop_order_id} to {new_stop_price:.4f}")
+                logger.info(f"Modified SL order ID: {current_stop_order_id} to {new_stop_price:.4f}")
                 return current_stop_order_id
 
         if not is_new_position:
             position = sync_position_with_okx(okx_account_api, trade_api, symbol)
+            logger.debug(f"Position check: {position}")
             if not position:
-                logger.warning(f"No position exists to set stop-loss for {symbol}")
+                logger.warning(f"No position exists to set SL for {symbol}")
                 return None
 
         params = {
@@ -551,38 +552,39 @@ def update_stop_loss(trade_api, symbol, side, new_stop_price, current_stop_order
             "slTriggerPx": str(new_stop_price),
             "slOrdPx": "-1",
             "slTriggerPxType": "mark",
-            "reduceOnly": "true",
+            "reduceOnly": True,
             "closeFraction": "1"
         }
         logger.debug(f"Placing SL order with params: {params}")
         stop_order = trade_api.place_algo_order(**params)
         logger.debug(f"SL order result: {stop_order}")
         if stop_order['code'] != "0":
-            logger.error(f"Failed to place stop-loss order: {stop_order.get('msg', '')}")
-            raise Exception(f"Failed to place stop-loss order")
+            logger.error(f"Failed to place SL order: {stop_order.get('msg', 'Unknown')}")
+            raise Exception(f"Failed to place SL order")
         algo_id = stop_order['data'][0]['algoId']
-        logger.info(f"Placed stop-loss order ID: {algo_id} at {new_stop_price:.4f}")
+        logger.info(f"Placed SL order ID: {algo_id} at {new_stop_price:.4f}")
         return algo_id
     except Exception as e:
-        logger.error(f"Failed to update stop-loss: {str(e)}", exc_info=True)
+        logger.error(f"Failed to update SL: {str(e)}", exc_info=True)
         raise
 
 def place_limit_orders(trend, st_line, run_id, symbol_config):
     global pending_orders
     min_range, max_range = ORDERS_RANGE[1] / 100, ORDERS_RANGE[0] / 100
-    base_size = POSITION_SIZE / ORDERS_PER_TRADE
+    base_size = POSITION_SIZE / ORDERS_PER_TRADE / 10  # Scale down: 100 / 10 / 10 = 1 XRP
 
     try:
         with db_lock:
             c = db_conn.cursor()
             balance = okx_account_api.get_account_balance()
+            logger.debug(f"Balance response: {balance}")
             if balance['code'] != "0":
                 logger.error(f"Failed to fetch balance: {balance['msg']}")
                 log_error("BalanceError", balance['msg'], "place_limit_orders")
                 return
             available_usdt = float(next((bal['availBal'] for bal in balance['data'][0]['details'] if bal['ccy'] == 'USDT'), 0))
             frozen_usdt = float(next((bal['frozenBal'] for bal in balance['data'][0]['details'] if bal['ccy'] == 'USDT'), 0))
-            required_margin = (POSITION_SIZE * st_line) / 10
+            required_margin = (POSITION_SIZE * st_line) / 100  # 10x leverage, scaled
             logger.debug(f"Margin check: Available {available_usdt:.2f} USDT, Frozen {frozen_usdt:.2f} USDT, Required {required_margin:.2f} USDT")
             if available_usdt < required_margin:
                 logger.error(f"Insufficient margin: Available {available_usdt:.2f} USDT, Frozen {frozen_usdt:.2f} USDT, Required {required_margin:.2f} USDT")
@@ -591,13 +593,14 @@ def place_limit_orders(trend, st_line, run_id, symbol_config):
 
             try:
                 orders = okx_trade_api.get_order_list(instType="SWAP", instId=OKX_TRADING_PAIR, ordType="limit")
+                logger.debug(f"Open orders: {orders}")
                 if orders['code'] == "0":
                     for order in orders['data']:
                         if order['state'] in ['live', 'partially_filled']:
                             okx_trade_api.cancel_order(instId=OKX_TRADING_PAIR, ordId=order['ordId'])
                             logger.debug(f"Canceled existing order ID: {order['ordId']}")
             except Exception as e:
-                logger.error(f"Failed to cancel existing orders: {str(e)}")
+                logger.error(f"Failed to cancel existing orders: {str(e)}", exc_info=True)
                 log_error("CancelError", str(e), "place_limit_orders")
 
             c.execute("UPDATE orders SET status = 'cancelled' WHERE status = 'pending'")
@@ -642,8 +645,8 @@ def place_limit_orders(trend, st_line, run_id, symbol_config):
 
         logger.info(f"Total contracts: {total_contracts:.2f} (~{total_contracts * symbol_config['contractSize'] * 10000:.2f} XRP, Total Margin {total_margin:.2f} USDT)")
         batch_result = okx_trade_api.place_multiple_orders(orders)
-        placed_count = 0
         logger.debug(f"Batch result: {json.dumps(batch_result, indent=2)}")
+        placed_count = 0
         if batch_result['code'] != "0":
             logger.error(f"Failed to place limit orders: {batch_result['msg']}")
             for order_data, order in zip(batch_result['data'], orders):
@@ -651,8 +654,8 @@ def place_limit_orders(trend, st_line, run_id, symbol_config):
                     logger.error(f"Invalid order data: {order_data}")
                     continue
                 if order_data.get('sCode') != "0":
-                    px = order_data.get('px', 'N/A')
-                    sz = order_data.get('sz', 'N/A')
+                    px = order_data.get('px', order['px'])
+                    sz = order_data.get('sz', order['sz'])
                     logger.error(f"Order failed: {order_data.get('sMsg', 'Unknown error')} (Price: {px}, Size: {sz})")
                     pending_orders = [o for o in pending_orders if o['price'] != float(order.get('px', 0))]
                     continue
@@ -688,33 +691,38 @@ def place_tp_orders(fill_data, run_id, symbol_config):
     try:
         with db_lock:
             c = db_conn.cursor()
-            fill_size = fill_data['size']  # Already scaled in order_websocket_handler
+            fill_size = fill_data['size']  # e.g., 102 XRP
             fill_price = fill_data['price']
             side = 'sell' if fill_data['side'] == 'buy' else 'buy'
             position_id = fill_data.get('position_id')
-            logger.debug(f"Placing TP orders: Fill size {fill_size:.2f} XRP, Price {fill_price:.4f}, Side {side}")
+            logger.info(f"Placing TP orders: Fill size {fill_size:.2f} XRP, Price {fill_price:.4f}, Side {side}, Position ID {position_id}")
 
             if isinstance(TP_PERCENTAGES, str):
                 tp_percentages = [float(p) for p in TP_PERCENTAGES.split(',')]
             else:
-                tp_percentages = [float(p) for p in TP_PERCENTAGES]
-            tp_size = fill_size / len(tp_percentages)  # e.g., 102 / 5 = 20.4 XRP
-            min_qty = symbol_config['minQty']  # 0.01 contracts
-            min_notional = symbol_config['minNotional']  # 0.01 USDT
+                tp_percentages = list(TP_PERCENTAGES)
+            logger.debug(f"TP percentages: {tp_percentages}")
+            if not tp_percentages:
+                logger.error("No TP percentages defined")
+                log_error("ConfigError", "No TP percentages defined", "place_tp_orders")
+                return
 
             orders = []
             for i, percentage in enumerate(tp_percentages):
                 tp_price = fill_price * (1 + percentage / 100) if fill_data['side'] == 'buy' else fill_price * (1 - percentage / 100)
                 tp_price = adjust_price(tp_price, symbol_config)
-                tp_contract_size = adjust_quantity(tp_size, symbol_config, tp_price)  # Convert XRP to contracts
+                tp_contract_size = adjust_quantity(fill_size, symbol_config, tp_price)  # Same size as fill
+                min_qty = symbol_config.get('minQty', 0.01)
+                min_notional = symbol_config.get('minNotional', 0.01)
                 if tp_contract_size < min_qty:
-                    logger.debug(f"TP order size {tp_contract_size:.2f} contracts below minQty {min_qty}, adjusting")
+                    logger.warning(f"TP order size {tp_contract_size:.2f} contracts below minQty {min_qty}, adjusting to minQty")
                     tp_contract_size = min_qty
                 tp_asset_size = tp_contract_size * symbol_config['contractSize'] * 10000
-                if tp_asset_size * tp_price < min_notional:
-                    logger.warning(f"TP order notional {tp_asset_size * tp_price:.4f} USDT below minNotional {min_notional}, skipping")
+                notional = tp_asset_size * tp_price
+                logger.debug(f"TP order {i+1}: Price {tp_price:.4f}, Size {tp_contract_size:.2f} contracts ({tp_asset_size:.2f} XRP), Notional {notional:.4f} USDT")
+                if notional < min_notional:
+                    logger.warning(f"TP order notional {notional:.4f} USDT below min {min_notional}, skipping")
                     continue
-                logger.debug(f"Preparing TP order: {side} at {tp_price:.4f} with size {tp_contract_size:.2f} contracts ({tp_asset_size:.2f} XRP)")
                 orders.append({
                     'instId': OKX_TRADING_PAIR,
                     'tdMode': 'isolated',
@@ -722,14 +730,15 @@ def place_tp_orders(fill_data, run_id, symbol_config):
                     'ordType': 'limit',
                     'px': str(tp_price),
                     'sz': str(tp_contract_size),
-                    'reduceOnly': 'true'
+                    'reduceOnly': True
                 })
 
             if not orders:
-                logger.warning("No valid TP orders to place")
+                logger.error("No valid TP orders generated")
+                log_error("OrderError", "No valid TP orders generated", "place_tp_orders")
                 return
 
-            logger.debug(f"Placing {len(orders)} TP orders")
+            logger.info(f"Submitting {len(orders)} TP orders")
             batch_result = okx_trade_api.place_multiple_orders(orders)
             logger.debug(f"TP batch result: {json.dumps(batch_result, indent=2)}")
             placed_count = 0
@@ -739,20 +748,20 @@ def place_tp_orders(fill_data, run_id, symbol_config):
                 return
 
             for order_data, order in zip(batch_result['data'], orders):
-                if order_data['sCode'] != "0":
-                    logger.warning(f"TP order failed: {order_data.get('sMsg', 'Unknown error')} (Price: {order_data.get('px', 'N/A')}, Size: {order_data.get('sz', 'N/A')})")
+                if order_data.get('sCode') != "0":
+                    logger.error(f"TP order failed: {order_data.get('sMsg', 'Unknown')} (Price: {order_data.get('px', 'N/A')}, Size: {order_data.get('sz', 'N/A')})")
                     continue
-                order_id = order_data['ordId']
+                order_id = order_data.get('ordId')
+                if not order_id:
+                    logger.error(f"No order ID in TP response: {order_data}")
+                    continue
                 c.execute('''INSERT INTO take_profits (trade_id, tp_level, order_id, price, size, status, timestamp, position_id, run_id)
                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                          (1, placed_count + 1, order_id, float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'] * 10000,
+                          (1, placed_count + 1, order_id, float(order['px']), float(order['sz']) * symbol_config['contractSize'] * 10000,
                            'pending', str(datetime.now(timezone.utc)), position_id, run_id))
                 placed_count += 1
             db_conn.commit()
-            if placed_count > 0:
-                logger.info(f"Placed {placed_count} TP orders for filled order")
-            else:
-                logger.warning("No TP orders placed due to failures")
+            logger.info(f"Placed {placed_count} TP orders for filled order")
     except Exception as e:
         logger.error(f"Error in place_tp_orders: {str(e)}", exc_info=True)
         log_error("GeneralError", str(e), "place_tp_orders")
