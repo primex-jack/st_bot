@@ -1051,8 +1051,8 @@ def on_open(ws):
     }
     ws.send(json.dumps(subscription))
 
-def on_message(ws, message):
-    global kline_data, previous_st_line, previous_trend, current_position, conn, latest_st_line, latest_trend, historical_data_fetched, first_closed_candle
+def on_message(ws, message, run_id):
+    global kline_data, previous_st_line, previous_trend, current_position, latest_st_line, latest_trend, historical_data_fetched, first_closed_candle
     try:
         data = json.loads(message)
         if 'data' not in data or 'k' not in data['data']:
@@ -1105,8 +1105,8 @@ def on_message(ws, message):
             st_line_shift = abs((latest_st_line - previous_st_line) / previous_st_line) if previous_st_line else 0
             logger.debug(f"Order placement check: first_candle={first_closed_candle}, trend_changed={previous_trend != latest_trend}, st_line_shift={st_line_shift:.4%}, has_position={bool(current_position)}, has_orders={bool(pending_orders)}")
             if (first_closed_candle and not current_position and not pending_orders) or (previous_trend != latest_trend or st_line_shift > ST_LINE_SHIFT_THRESHOLD):
-                logger.info(f"Placing limit orders: Trend={latest_trend}, ST_LINE={latest_st_line:.2f}")
-                place_limit_orders(latest_trend, latest_st_line, conn, symbol_config)
+                logger.info(f"Placing limit orders: Trend={latest_trend}, ST_LINE={latest_st_line:.4f}")
+                place_limit_orders(latest_trend, latest_st_line, run_id, symbol_config)
 
             if current_position:
                 okx_position = sync_position_with_okx(okx_account_api, okx_trade_api, OKX_TRADING_PAIR)
@@ -1120,10 +1120,11 @@ def on_message(ws, message):
                 if stop_loss_order_id:
                     current_position['stop_loss'] = stop_loss
                     current_position['stop_loss_order_id'] = stop_loss_order_id
-                    c = conn.cursor()
-                    c.execute("UPDATE trades SET stop_loss = ?, stop_loss_order_id = ? WHERE position_id = ?",
-                              (stop_loss, stop_loss_order_id, current_position['position_id']))
-                    conn.commit()
+                    with db_lock:
+                        c = db_conn.cursor()
+                        c.execute("UPDATE trades SET stop_loss = ?, stop_loss_order_id = ? WHERE position_id = ?",
+                                  (stop_loss, stop_loss_order_id, current_position['position_id']))
+                        db_conn.commit()
                 if (current_position['side'] == 'LONG' and latest_close <= current_position['stop_loss']) or \
                    (current_position['side'] == 'SHORT' and latest_close >= current_position['stop_loss']):
                     cancel_all_stop_loss_orders(okx_trade_api, OKX_TRADING_PAIR)
@@ -1140,12 +1141,12 @@ def on_message(ws, message):
                             tdMode="isolated",
                             side=close_side,
                             ordType="market",
-                            sz=str(round(close_quantity / symbol_config['contractSize'], symbol_config['quantityPrecision'])),
+                            sz=str(close_quantity),
                             reduceOnly="true"
                         )
                         if close_result['code'] != "0":
                             logger.error(f"Failed to close position: {close_result['msg']}")
-                            log_error(f"Failed to close position: {close_result['msg']}", "stop_loss_trigger")
+                            log_error("CloseError", close_result['msg'], "stop_loss_trigger")
                             raise Exception(f"Failed to close position")
                     ord_id = close_result['data'][0].get('ordId', 'unknown') if close_result['code'] == "0" and 'data' in close_result else 'unknown'
                     trade = {
@@ -1164,13 +1165,14 @@ def on_message(ws, message):
                         'position_id': current_position['position_id']
                     }
                     trade_history.append(trade)
-                    c = conn.cursor()
-                    c.execute('''INSERT INTO trades (timestamp, trading_pair, timeframe, side, entry_price, size, exit_price, stop_loss, profit_loss, trend, order_id, stop_loss_order_id, position_id)
-                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                              (trade['timestamp'], trade['trading_pair'], trade['timeframe'], trade['side'],
-                               trade['entry_price'], trade['size'], trade['exit_price'], trade['stop_loss'],
-                               trade['profit_loss'], trade['trend'], trade['order_id'], trade['stop_loss_order_id'], trade['position_id']))
-                    conn.commit()
+                    with db_lock:
+                        c = db_conn.cursor()
+                        c.execute('''INSERT INTO trades (timestamp, trading_pair, timeframe, side, entry_price, size, exit_price, stop_loss, profit_loss, trend, order_id, stop_loss_order_id, position_id)
+                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                                  (trade['timestamp'], trade['trading_pair'], trade['timeframe'], trade['side'],
+                                   trade['entry_price'], trade['size'], trade['exit_price'], trade['stop_loss'],
+                                   trade['profit_loss'], trade['trend'], trade['order_id'], trade['stop_loss_order_id'], trade['position_id']))
+                        db_conn.commit()
                     logger.info(f"Stop-loss triggered: Closed {trade['side']} at {latest_close:.2f}, P/L: {trade['profit_loss']:.2f} USDT")
                     current_position = None
 
@@ -1179,8 +1181,8 @@ def on_message(ws, message):
             previous_trend = latest_trend
 
     except Exception as e:
-        logger.error(f"Candle WebSocket error: {str(e)} (Message: {message})")
-        log_error(f"Candle WebSocket error: {str(e)}", "on_message")
+        logger.error(f"Candle WebSocket error: {str(e)}")
+        log_error("WebSocketError", str(e), "on_message")
 
 def on_error(ws, error):
     logger.error(f"Candle WebSocket error: {str(error)}")
