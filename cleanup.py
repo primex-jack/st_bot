@@ -50,11 +50,12 @@ def cleanup_okx_positions_and_orders(api_key, api_secret_key, passphrase, inst_i
 
     # Cancel all algo orders (stop-loss, take-profit)
     try:
-        algo_orders = trade_api.get_algo_order_list(instType="SWAP", instId=inst_id, ordType="conditional")
+        algo_orders = trade_api.order_algos_list(instType="SWAP", instId=inst_id, ordType="conditional")
         if algo_orders['code'] == "0" and algo_orders['data']:
             for order in algo_orders['data']:
-                result = trade_api.cancel_algo_order([{"instId": inst_id, "algoId": order['algoId']}])
-                logger.info(f"Canceled algo order {order['algoId']}: {result}")
+                if order['state'] in ['live', 'effective']:
+                    result = trade_api.cancel_algo_order([{"instId": inst_id, "algoId": order['algoId']}])
+                    logger.info(f"Canceled algo order {order['algoId']}: {result}")
         else:
             logger.info("No open algo orders found.")
     except Exception as e:

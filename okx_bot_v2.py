@@ -381,29 +381,32 @@ def fetch_symbol_config_from_api(symbol, public_api):
         raise
 
 def adjust_quantity(quantity, symbol_config, price):
-    contract_size = symbol_config['contractSize']
-    lot_size = symbol_config.get('lotSize', 1.0)
-    precision = symbol_config['quantityPrecision']
-    min_qty = symbol_config['minQty']
-    min_notional = symbol_config['minNotional']
-    min_qty_notional = max(min_qty, min_notional / price / contract_size)
+    contract_size = symbol_config['contractSize']  # e.g., 0.01 XRP per contract
+    lot_size = symbol_config.get('lotSize', 0.01)  # e.g., 0.01
+    precision = symbol_config['quantityPrecision']  # e.g., 2
+    min_qty = symbol_config['minQty']  # e.g., 0.01
+    min_notional = symbol_config['minNotional']  # e.g., 0.01 USDT
 
-    contracts = quantity / contract_size
+    # Calculate contracts (quantity in XRP / contract size)
+    contracts = quantity / contract_size  # e.g., 0.01 XRP / 0.01 = 1 contract
     logger.debug(f"Initial contracts: {contracts:.4f}")
 
-    lots = contracts / lot_size
-    rounded_lots = round(max(lots, min_qty_notional / lot_size))
-    adjusted_contracts = rounded_lots * lot_size
-    adjusted = round(adjusted_contracts, precision)
+    # Ensure compliance with lot size and minimum notional
+    min_qty_notional = max(min_qty, min_notional / price / contract_size)  # e.g., max(0.01, 0.01 / 2.177 / 0.01)
+    lots = contracts / lot_size  # e.g., 1 / 0.01 = 100 lots
+    rounded_lots = round(max(lots, min_qty_notional / lot_size) / lot_size) * lot_size  # e.g., round(100 / 0.01) * 0.01 = 100
+    adjusted_contracts = round(rounded_lots * lot_size, precision)  # e.g., round(100 * 0.01, 2) = 100.00
 
-    if adjusted % lot_size != 0:
-        adjusted = round(adjusted / lot_size) * lot_size
-    if adjusted < min_qty:
-        adjusted = min_qty
-        logger.debug(f"Adjusted quantity increased to meet minQty: {adjusted} contracts")
+    # Ensure multiple of lot size
+    adjusted_contracts = round(adjusted_contracts / lot_size) * lot_size
+    if adjusted_contracts < min_qty:
+        adjusted_contracts = min_qty
+        logger.debug(f"Adjusted quantity increased to meet minQty: {adjusted_contracts:.2f} contracts")
 
-    logger.debug(f"Adjusted quantity: {adjusted:.2f} contracts (effective {adjusted * contract_size:.4f} asset units)")
-    return adjusted  # Returns contracts
+    # Verify effective size
+    effective_size = adjusted_contracts * contract_size  # e.g., 100 * 0.01 = 1 XRP
+    logger.debug(f"Adjusted quantity: {adjusted_contracts:.2f} contracts (effective {effective_size:.4f} XRP)")
+    return adjusted_contracts  # Returns contracts
 
 def adjust_price(price, symbol_config):
     precision = symbol_config.get('pricePrecision', 4)
@@ -571,6 +574,7 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
         available_usdt = float(next((bal['availBal'] for bal in balance['data'][0]['details'] if bal['ccy'] == 'USDT'), 0))
         frozen_usdt = float(next((bal['frozenBal'] for bal in balance['data'][0]['details'] if bal['ccy'] == 'USDT'), 0))
         required_margin = (POSITION_SIZE * st_line) / 10  # 10x leverage
+        logger.debug(f"Margin check: Available {available_usdt:.2f} USDT, Frozen {frozen_usdt:.2f} USDT, Required {required_margin:.2f} USDT")
         if available_usdt < required_margin:
             logger.error(f"Insufficient margin: Available {available_usdt:.2f} USDT, Frozen {frozen_usdt:.2f} USDT, Required {required_margin:.2f} USDT")
             log_error(f"Insufficient margin: Available {available_usdt:.2f} USDT, Frozen {frozen_usdt:.2f} USDT, Required {required_margin:.2f} USDT", "place_limit_orders")
@@ -600,11 +604,13 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
             side = 'sell'
 
         orders = []
+        total_contracts = 0
         for i in range(ORDERS_PER_TRADE):
             price = base_price + (i / (ORDERS_PER_TRADE - 1)) * price_range if ORDERS_PER_TRADE > 1 else base_price
             size = base_size * (1 + random.uniform(-0.1, 0.1))
             price = adjust_price(price, symbol_config)
             contract_size = adjust_quantity(size, symbol_config, price)
+            total_contracts += contract_size
             logger.debug(f"Preparing order: {side} at {price:.4f} with size {contract_size:.2f} contracts ({contract_size * symbol_config['contractSize']:.4f} XRP)")
             orders.append({
                 'instId': OKX_TRADING_PAIR,
@@ -621,6 +627,7 @@ def place_limit_orders(trend, st_line, conn, symbol_config):
                 'position_id': None
             })
 
+        logger.debug(f"Total contracts: {total_contracts:.2f} (~{total_contracts * symbol_config['contractSize']:.4f} XRP)")
         batch_result = okx_trade_api.place_multiple_orders(orders)
         placed_count = 0
         if batch_result['code'] != "0":
