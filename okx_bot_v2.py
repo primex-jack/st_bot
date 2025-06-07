@@ -27,7 +27,7 @@ from okx.PublicData import PublicAPI
 init()
 
 # Script Version
-SCRIPT_VERSION = "2.0.17"
+SCRIPT_VERSION = "2.0.19"
 
 # Set up logging
 logger = logging.getLogger(__name__)
