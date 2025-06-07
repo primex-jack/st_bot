@@ -560,30 +560,117 @@ def update_stop_loss(trade_api, symbol, side, new_stop_price, current_stop_order
         raise
 
 def place_limit_orders(trend, st_line, run_id, symbol_config):
-    # ... (previous code up to orders loop) ...
-    for i in range(ORDERS_PER_TRADE):
-        price = base_price + (i / (ORDERS_PER_TRADE - 1)) * price_range if ORDERS_PER_TRADE > 1 else base_price
-        size = base_size * (1 + random.uniform(-0.1, 0.1))  # e.g., ~90–110 XRP
-        price = adjust_price(price, symbol_config)
-        contract_size = adjust_quantity(size, symbol_config, price)  # e.g., ~90–110 contracts
-        total_contracts += contract_size
-        logger.debug(f"Preparing order: {side} at {price:.4f} with size {contract_size:.2f} contracts ({contract_size * symbol_config['contractSize'] * 100:.2f} XRP)")
-        orders.append({
-            'instId': OKX_TRADING_PAIR,
-            'tdMode': 'isolated',
-            'side': side,
-            'ordType': 'limit',
-            'px': str(price),
-            'sz': str(contract_size)
-        })
-        pending_orders.append({
-            'price': price,
-            'size': contract_size * symbol_config['contractSize'] * 100,
-            'side': side,
-            'position_id': None
-        })
-    logger.info(f"Total contracts: {total_contracts:.2f} (~{total_contracts * symbol_config['contractSize'] * 100:.2f} XRP)")
-    # ... (rest of the function) ...
+    global pending_orders
+    min_range, max_range = ORDERS_RANGE[1] / 100, ORDERS_RANGE[0] / 100
+    base_size = POSITION_SIZE / ORDERS_PER_TRADE  # e.g., 1000 / 10 = 100 XRP
+
+    try:
+        with db_lock:
+            c = db_conn.cursor()
+            balance = okx_account_api.get_account_balance()
+            if balance['code'] != "0":
+                logger.error(f"Failed to fetch balance: {balance['msg']}")
+                log_error("BalanceError", balance['msg'], "place_limit_orders")
+                return
+            available_usdt = float(next((bal['availBal'] for bal in balance['data'][0]['details'] if bal['ccy'] == 'USDT'), 0))
+            frozen_usdt = float(next((bal['frozenBal'] for bal in balance['data'][0]['details'] if bal['ccy'] == 'USDT'), 0))
+            required_margin = (POSITION_SIZE * st_line) / 10  # 10x leverage
+            logger.debug(f"Margin check: Available {available_usdt:.2f} USDT, Frozen {frozen_usdt:.2f} USDT, Required {required_margin:.2f} USDT")
+            if available_usdt < required_margin:
+                logger.error(f"Insufficient margin: Available {available_usdt:.2f} USDT, Frozen {frozen_usdt:.2f} USDT, Required {required_margin:.2f} USDT")
+                log_error("MarginError", f"Insufficient margin: Available {available_usdt:.2f} USDT", "place_limit_orders")
+                return
+
+            try:
+                orders = okx_trade_api.get_order_list(instType="SWAP", instId=OKX_TRADING_PAIR, ordType="limit")
+                if orders['code'] == "0":
+                    for order in orders['data']:
+                        if order['state'] in ['live', 'partially_filled']:
+                            okx_trade_api.cancel_order(instId=OKX_TRADING_PAIR, ordId=order['ordId'])
+                            logger.debug(f"Canceled existing order ID: {order['ordId']}")
+            except Exception as e:
+                logger.error(f"Failed to cancel existing orders: {str(e)}")
+                log_error("CancelError", str(e), "place_limit_orders")
+
+            c.execute("UPDATE orders SET status = 'cancelled' WHERE status = 'pending'")
+            db_conn.commit()
+
+        pending_orders = []
+        # Define base_price, price_range, and side
+        if trend == 1:
+            base_price = st_line * (1 + min_range)
+            price_range = st_line * (max_range - min_range)
+            side = 'buy'
+        else:
+            base_price = st_line * (1 - max_range)
+            price_range = st_line * (max_range - min_range)
+            side = 'sell'
+
+        orders = []
+        total_contracts = 0
+        for i in range(ORDERS_PER_TRADE):
+            price = base_price + (i / (ORDERS_PER_TRADE - 1)) * price_range if ORDERS_PER_TRADE > 1 else base_price
+            size = base_size * (1 + random.uniform(-0.1, 0.1))  # e.g., ~90–110 XRP
+            price = adjust_price(price, symbol_config)
+            contract_size = adjust_quantity(size, symbol_config, price)  # e.g., ~90–110 contracts
+            total_contracts += contract_size
+            logger.debug(f"Preparing order: {side} at {price:.4f} with size {contract_size:.2f} contracts ({contract_size * symbol_config['contractSize'] * 100:.2f} XRP)")
+            orders.append({
+                'instId': OKX_TRADING_PAIR,
+                'tdMode': 'isolated',
+                'side': side,
+                'ordType': 'limit',
+                'px': str(price),
+                'sz': str(contract_size)
+            })
+            pending_orders.append({
+                'price': price,
+                'size': contract_size * symbol_config['contractSize'] * 100,
+                'side': side,
+                'position_id': None
+            })
+
+        logger.info(f"Total contracts: {total_contracts:.2f} (~{total_contracts * symbol_config['contractSize'] * 100:.2f} XRP)")
+        batch_result = okx_trade_api.place_multiple_orders(orders)
+        placed_count = 0
+        if batch_result['code'] != "0":
+            logger.error(f"Failed to place limit orders: {batch_result['msg']}")
+            for order_data in batch_result['data']:
+                if order_data['sCode'] != "0":
+                    px = order_data.get('px', 'N/A')
+                    sz = order_data.get('sz', 'N/A')
+                    logger.error(f"Order failed: {order_data['sMsg']} (Price: {px}, Size: {sz})")
+                else:
+                    placed_count += 1
+            log_error("PlaceOrderError", f"Failed to place limit orders: {batch_result['msg']}", "place_limit_orders")
+            if placed_count == 0:
+                pending_orders = []
+                with db_lock:
+                    c.execute("DELETE FROM orders WHERE status = 'pending'")
+                    db_conn.commit()
+            logger.info(f"Placed {placed_count} limit orders for trend {trend}")
+            return
+
+        with db_lock:
+            c = db_conn.cursor()
+            for order_data, order in zip(batch_result['data'], orders):
+                if order_data['sCode'] != "0":
+                    px = order_data.get('px', 'N/A')
+                    sz = order_data.get('sz', 'N/A')
+                    logger.error(f"Order failed: {order_data['sMsg']} (Price: {px}, Size: {sz})")
+                    pending_orders = [o for o in pending_orders if o['price'] != float(order_data.get('px', 0))]
+                    continue
+                order_id = order_data['ordId']
+                c.execute('''INSERT INTO orders (trade_id, order_id, side, price, size, status, timestamp, position_id, run_id)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                          (1, order_id, order['side'], float(order_data['px']), float(order_data['sz']) * symbol_config['contractSize'] * 100,
+                           'pending', str(datetime.now(timezone.utc)), None, run_id))
+                placed_count += 1
+            db_conn.commit()
+        logger.info(f"Placed {placed_count} limit orders for trend {trend}")
+    except Exception as e:
+        logger.error(f"Error in place_limit_orders: {str(e)}")
+        log_error("GeneralError", str(e), "place_limit_orders")
 
 def place_tp_orders(fill_data, run_id, symbol_config):
     try:
