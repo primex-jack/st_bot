@@ -25,6 +25,8 @@ def load_config(config_path='config.json'):
         logger.error(f"Failed to load config from {config_path}: {str(e)}")
         raise
 
+BOT_INSTANCE_ID = 'v2_bot1'
+
 def cleanup_okx_positions_and_orders(api_key, api_secret_key, passphrase, inst_id='XRP-USDT-SWAP'):
     """Close positions and cancel orders on OKX."""
     trade_api = TradeAPI(
@@ -48,7 +50,7 @@ def cleanup_okx_positions_and_orders(api_key, api_secret_key, passphrase, inst_i
     except Exception as e:
         logger.error(f"Error canceling limit orders: {str(e)}")
 
-    # Cancel all algo orders (stop-loss, take-profit)
+    # Cancel all algo orders
     try:
         algo_orders = trade_api.order_algos_list(instType="SWAP", instId=inst_id, ordType="conditional")
         if algo_orders['code'] == "0" and algo_orders['data']:
@@ -73,13 +75,10 @@ def cleanup_okx_positions_and_orders(api_key, api_secret_key, passphrase, inst_i
 
     # Delete database
     try:
-        if os.path.exists('trade_db_v2.db'):
-            os.remove('trade_db_v2.db')
-            logger.info("Deleted database: trade_db_v2.db")
-        if os.path.exists('trade_db_v2.db-shm'):
-            os.remove('trade_db_v2.db-shm')
-        if os.path.exists('trade_db_v2.db-wal'):
-            os.remove('trade_db_v2.db-wal')
+        for db_file in ['trade_db_v2.db', 'trade_db_v2.db-shm', 'trade_db_v2.db-wal']:
+            if os.path.exists(db_file):
+                os.remove(db_file)
+                logger.info(f"Deleted database file: {db_file}")
     except Exception as e:
         logger.error(f"Error deleting database: {str(e)}")
 
